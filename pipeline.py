@@ -37,12 +37,12 @@ from torch import Tensor
 
 try:  # package import (e.g. `from vpa.pipeline import ...`)
     from .perception import TextEncoderWrapper, VisionEncoder
-    from .predictor import JEPAPredictor
+    from .predictor import JEPAPredictor, VICRegLoss
     from .selector import MilestoneTracker, NeuroSymbolicSelector
     from .solver import FlowMatchingSolver, UncertaintyHorizonFilter, executed_prefix_mask
 except ImportError:  # flat import (files side by side, `python pipeline.py`)
     from perception import TextEncoderWrapper, VisionEncoder
-    from predictor import JEPAPredictor
+    from predictor import JEPAPredictor, VICRegLoss
     from selector import MilestoneTracker, NeuroSymbolicSelector
     from solver import FlowMatchingSolver, UncertaintyHorizonFilter, executed_prefix_mask
 
@@ -302,6 +302,33 @@ class VPAInferencePipeline(nn.Module):
         )
         if not all(math.isclose(s, scales[0], rel_tol=1e-6) for s in scales):
             raise RuntimeError(f"inconsistent gamma* across tracker/predictor/solver: {scales}")
+
+    # ------------------------------------------------------------------ shared eps (Eqs. 9b, 18)
+    def make_vicreg_loss(
+        self,
+        lambda_v: float,
+        lambda_c: float,
+        gamma: float = 1.0,
+        head_reduction: str = "mean",
+    ) -> VICRegLoss:
+        """Build the Eq. 11 objective with the same eps as the tracker's Eq. 9b.
+
+        Eq. 9b uses "the numerical constant of Eq. 18", so v(Z) and gamma_bar must share one eps.
+        This factory takes it from ``self.tracker.eps`` (set from ``VPAConfig.vicreg_eps``).
+
+        Returns:
+            ``VICRegLoss`` whose ``eps`` equals ``self.tracker.eps``.
+        """
+        return VICRegLoss(lambda_v, lambda_c, gamma=gamma, eps=self.tracker.eps,
+                          head_reduction=head_reduction)  # type: ignore[arg-type]
+
+    def check_vicreg_loss(self, loss: VICRegLoss) -> None:
+        """Raise ``ValueError`` if ``loss.eps`` differs from the tracker's eps (Eqs. 9b, 18)."""
+        if loss.eps != self.tracker.eps:
+            raise ValueError(
+                f"VICRegLoss eps = {loss.eps} but MilestoneTracker eps = {self.tracker.eps}; "
+                "Eq. 9b must use the eps of Eq. 18"
+            )
 
     # ------------------------------------------------------------------ episode management
     @torch.no_grad()
@@ -720,6 +747,13 @@ def _self_test() -> None:
             delattr(target, attr)  # restore the class method
         assert all(torch.equal(x, y) for x, y in zip(before, _snapshot(pipe), strict=True))
     assert pipe.step(frames(b), proprio()).num_sequential_evaluations == 2 + 3  # restored
+
+    # ---- Eqs. 9b / 18 share one eps.
+    loss_fn = pipe.make_vicreg_loss(lambda_v=25.0, lambda_c=1.0, head_reduction="sum")
+    assert loss_fn.eps == pipe.tracker.eps and loss_fn.head_reduction == "sum"
+    pipe.check_vicreg_loss(loss_fn)
+    _expect(ValueError, lambda: pipe.check_vicreg_loss(
+        VICRegLoss(lambda_v=25.0, lambda_c=1.0, eps=10.0 * pipe.tracker.eps)))
     print("pipeline.py self-test passed")
 
 if __name__ == "__main__":
