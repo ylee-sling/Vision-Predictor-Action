@@ -463,7 +463,8 @@ class _CountingField(nn.Module):
         self.calls: List[float] = []
 
     def forward(self, actions: Tensor, rho: Union[float, Tensor], cond: Tensor) -> Tensor:
-        self.calls.append(float(torch.as_tensor(rho).reshape(-1)[0]))
+        # Record rho exactly as passed: torch.as_tensor(float) would round to float32 (1/3 != 1/3).
+        self.calls.append(rho if isinstance(rho, float) else float(rho.reshape(-1)[0]))
         return self.field(actions, rho, cond)
 
 
