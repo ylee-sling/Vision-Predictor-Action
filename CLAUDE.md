@@ -53,13 +53,23 @@ ruff check --select F,E9,B,PLE,PLW .
 
 ## Current status
 
-The code was written in an environment without PyTorch and **has never been executed**.
-It compiles and passes the lint above. Work in this order:
+Verified on macOS 15 / Apple M4 with Python 3.13, torch 2.14.1 and transformers 5.19.0
+(`requirements.txt`). All networks still have random weights; there are no trained checkpoints.
 
-1. Run each self-test on CPU in the order above and fix the failures.
-2. Run a pipeline smoke test on MPS: build with `VPAConfig()`, `calibrate(...)`, `reset(...)`,
-   then `step(...)` and `act(...)`, and check that `num_sequential_evaluations == K + 3`.
-3. Add or extend the tensor-calculation self-tests (see the testing rules below).
+Done:
+
+1. All five self-tests pass on CPU in the order above, and the lint passes. The one failure found
+   on the first run was in a test helper (`solver._CountingField` recorded ρ_k in float32).
+2. Pipeline smoke test on MPS: `VPAConfig()` → `from_config` (real CLIP) → `calibrate` → `reset` →
+   `act`/`step` reports `num_sequential_evaluations == K + 3` (the README quick start).
+   `bench_latency.py` also asserts K + 3 on every `step()` for K ∈ {1,2,3}, H ∈ {8,…,128} on MPS.
+3. Every module's `_self_test()` checks values against independent float64 references, covering
+   the edge cases listed in the testing rules below.
+4. An independent equation-by-equation audit against the PDF found no discrepancies. The
+   interpretive choices it surfaced are listed under "Decisions where the paper is silent".
+
+Open (see the README roadmap): training loops and checkpoints, the Section 6 evaluation
+(Isaac Sim, ManiSkill3), the per-milestone time-out and spectral normalization.
 
 ## Non-negotiable rules
 
