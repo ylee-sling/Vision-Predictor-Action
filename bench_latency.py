@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-3.0-only
+# Copyright (C) 2026 SLING AI Inc.
 """
 bench_latency.py -- per-stage latency of one VPA decision step (preprint_261008.pdf, Eq. 17).
 

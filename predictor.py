@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-3.0-only
+# Copyright (C) 2026 SLING AI Inc.
 """
 predictor.py -- Stage 3 of the Goal-Conditioned VPA framework (preprint_261008.pdf, Secs. 4.3 and 5.2).
 

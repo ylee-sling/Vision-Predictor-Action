@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-3.0-only
+# Copyright (C) 2026 SLING AI Inc.
 """
 pipeline.py -- Closed-loop VPA inference (preprint_261008.pdf, Fig. 2, Sec. 4, Prop. 5.1).
 

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-3.0-only
+# Copyright (C) 2026 SLING AI Inc.
 """
 perception.py -- Stage 1 of the Goal-Conditioned VPA framework (preprint_261008.pdf, Sec. 4.1).
 

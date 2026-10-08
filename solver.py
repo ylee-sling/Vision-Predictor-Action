@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-3.0-only
+# Copyright (C) 2026 SLING AI Inc.
 """
 solver.py -- Stage 4 of the Goal-Conditioned VPA framework (preprint_261008.pdf, Secs. 4.4 and 4.5).
 
