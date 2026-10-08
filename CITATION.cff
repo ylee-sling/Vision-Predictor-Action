@@ -1,0 +1,26 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the preprint below."
+title: "Vision-Predictor-Action (VPA): reference implementation"
+type: software
+authors:
+  - family-names: Lee
+    given-names: Yeonseok
+    email: ylee@sling.ai.kr
+    orcid: "https://orcid.org/0009-0004-6153-0205"
+    affiliation: "SLING AI Inc."
+license: GPL-3.0-only
+preferred-citation:
+  type: generic
+  title: "Vision-Predictor-Action: Towards Efficient Embodied AI via Neuro-Symbolic JEPA Predictors"
+  authors:
+    - family-names: Lee
+      given-names: Yeonseok
+      email: ylee@sling.ai.kr
+      orcid: "https://orcid.org/0009-0004-6153-0205"
+      affiliation: "SLING AI Inc."
+  publisher:
+    name: Zenodo
+  year: 2026
+  doi: "10.5281/zenodo.22960919"
+  url: "https://doi.org/10.5281/zenodo.22960919"
+  notes: "Preprint"
