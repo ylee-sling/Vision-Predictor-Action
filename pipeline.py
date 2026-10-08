@@ -469,7 +469,18 @@ class VPAInferencePipeline(nn.Module):
 # ---------------------------------------------------------------------------------------------
 # Self-test (run: python pipeline.py)
 # ---------------------------------------------------------------------------------------------
-def _tiny_pipeline(horizon: int, k_steps: int) -> VPAInferencePipeline:
+_GAMMA_STAR = 1.25  # exactly representable in float32
+
+
+def _calibration_stats() -> Tuple[Tensor, Tensor, Tensor]:
+    """Fixed non-trivial (mu_Z [16], mu_S [6], sigma_S [6]) used by every tiny pipeline."""
+    g = torch.Generator().manual_seed(5)
+    return torch.randn(16, generator=g), torch.randn(6, generator=g), torch.rand(6, generator=g) + 0.5
+
+
+def _tiny_pipeline(
+    horizon: int, k_steps: int, kappa: float = 0.01, beta: float = 0.5, calibrate: bool = True
+) -> VPAInferencePipeline:
     try:
         from .perception import _ToyTextModel, _toy_tokenizer
     except ImportError:
@@ -477,78 +488,239 @@ def _tiny_pipeline(horizon: int, k_steps: int) -> VPAInferencePipeline:
 
     cfg = VPAConfig(
         image_size=(32, 32), patch_size=8, vit_width=32, vit_depth=2, vit_heads=4, latent_dim=16,
-        num_primitives=4, selector_hidden=(32,), kappa=0.2, alpha_gamma=0.5,
+        num_primitives=4, selector_hidden=(32,), kappa=kappa, alpha_gamma=0.5,
         ensemble_heads=3, predictor_embed_dim=8, predictor_hidden=32, predictor_hidden_layers=1,
         proprio_dim=6, action_dim=3, primitive_embed_dim=8, horizon=horizon, min_horizon=2,
-        integration_steps=k_steps, beta=0.5, alpha_sigma=0.2,
+        integration_steps=k_steps, beta=beta, alpha_sigma=0.2,
         field_width=32, field_depth=2, field_heads=4, time_embed_dim=16,
     )
     text = TextEncoderWrapper(text_model=_ToyTextModel(projection_dim=12), tokenizer=_toy_tokenizer)
     pipe = VPAInferencePipeline.from_config(cfg, text_encoder=text)
-    pipe.calibrate(1.0, torch.zeros(16), torch.zeros(6), torch.ones(6))
+    if calibrate:
+        mu_z, mu_s, sd_s = _calibration_stats()
+        pipe.calibrate(_GAMMA_STAR, mu_z, mu_s, sd_s)
     return pipe
+
+
+def _expect(exc: type, fn: Callable[[], Any]) -> None:
+    try:
+        fn()
+    except exc:
+        return
+    raise AssertionError(f"expected {exc.__name__}")
+
+
+def _record_chain(pipe: VPAInferencePipeline) -> List[str]:
+    """Attach test-owned forward hooks (independent of the pipeline's audit) and return their log."""
+    log: List[str] = []
+    for name, module in (("E_psi", pipe.vision_encoder), ("pi_phi_h", pipe.selector),
+                         ("P_omega", pipe.predictor), ("v_theta", pipe.solver.vector_field)):
+        module.register_forward_hook(lambda *_args, n=name: log.append(n))
+    return log
+
+
+def _ref_horizon(pipe: VPAInferencePipeline, sigma_bar: Tensor) -> List[int]:
+    """Eq. 15 in float64, with a guard that float32 rounding cannot move the floor."""
+    f = pipe.horizon_filter
+    out = []
+    for s in sigma_bar.tolist():
+        x = f.h_max * math.exp(-f.beta * s)
+        assert abs(x - round(x)) > 1e-4, x
+        out.append(max(f.h_min, math.floor(x)))
+    return out
+
+
+def _snapshot(pipe: VPAInferencePipeline) -> List[Tensor]:
+    prefix = pipe.execution_prefix
+    assert prefix is not None and pipe.tracker.m is not None and pipe.horizon_filter.sigma_bar is not None
+    return [pipe.tracker.m.clone(), pipe.tracker.task_complete.clone(), pipe.horizon_filter.sigma_bar.clone()] + [
+        t.clone() for t in prefix]
 
 
 def _self_test() -> None:
     torch.manual_seed(0)
-    b, m, c, h_img = 2, 2, 3, 32
+    gen = torch.Generator().manual_seed(77)
+    b, m, c, h_img, ds, da = 3, 2, 3, 32, 6, 3
+    texts = ["move the cup", "throw the cup away", "push the block"]
 
-    # Depth is K + 3 for every K and does not change with H.
+    def frames(*shape: int) -> Tensor:
+        return torch.randn(*shape, c, h_img, h_img, generator=gen)
+
+    def proprio() -> Tensor:
+        return torch.randn(b, ds, generator=gen)
+
+    # ---- Prop. 5.1: depth K + 3 and call order, for every K and H.
     for k_steps in (1, 2, 3):
-        for horizon in (4, 32):
+        for horizon in (4, 16, 64):
             pipe = _tiny_pipeline(horizon, k_steps)
-            obs = torch.randn(b, c, h_img, h_img)
-            pipe.reset(["move the cup", "throw the cup away"], torch.randn(b, m, c, h_img, h_img))
-            out = pipe.step(obs, torch.randn(b, 6))
+            log = _record_chain(pipe)
+            pipe.reset(texts, frames(b, m))
+            log.clear()  # milestone encoding in reset() is per-episode, not on the per-step chain
+            out = pipe.step(frames(b), proprio())
+            assert log == ["E_psi", "pi_phi_h", "P_omega"] + ["v_theta"] * k_steps, log
             assert out.num_sequential_evaluations == k_steps + 3
-            assert out.action_chunk.shape == (b, horizon, 3)
-            assert bool(((out.executed_horizon >= 2) & (out.executed_horizon <= horizon)).all())
+            assert out.action_chunk.shape == (b, horizon, da) and out.executed_mask.shape == (b, horizon)
             assert out.conditioning.shape == (b, pipe.solver.cond_dim)
 
-    # Milestone pointer: a milestone frame identical to the observation is reached (distance 0).
-    pipe = _tiny_pipeline(8, 2)
-    obs = torch.randn(b, c, h_img, h_img)
-    goals = torch.randn(b, m, c, h_img, h_img)
-    goals[:, 0] = obs
-    pipe.reset("pick up the block", goals)
-    out = pipe.step(obs, torch.randn(b, 6))
-    assert torch.equal(out.milestone_pointer, torch.ones(b, dtype=torch.long))
-    assert torch.equal(out.next_milestone_pointer, torch.full((b,), 2, dtype=torch.long))
-    assert not bool(out.task_complete.any())
-    pipe.reset("pick up the block", obs.unsqueeze(1))  # M = 1: reaching it completes the task
-    assert bool(pipe.step(obs, torch.randn(b, 6)).task_complete.all())
+    # ---- Calibration: one gamma* in tracker, predictor and solver; errors before calibrate/reset.
+    raw = _tiny_pipeline(16, 2, calibrate=False)
+    _expect(RuntimeError, lambda: raw.reset(texts, frames(b, m)))
+    _expect(RuntimeError, lambda: raw.step(frames(b), proprio()))
+    mu_z, mu_s, sd_s = _calibration_stats()
+    tau_star = raw.calibrate(_GAMMA_STAR, mu_z, mu_s, sd_s)
+    assert raw.tracker.gamma_bar_star == _GAMMA_STAR
+    assert float(raw.predictor.latent_scale) == _GAMMA_STAR and float(raw.solver.gamma_bar_star) == _GAMMA_STAR
+    assert math.isclose(tau_star, raw.tracker.kappa * math.sqrt(2 * 16) * _GAMMA_STAR, rel_tol=1e-12)
+    assert not any(p.requires_grad for p in raw.vision_encoder.parameters())
+    assert not any(p.requires_grad for p in raw.predictor.parameters()) and not raw.training
+    _expect(RuntimeError, lambda: raw.step(frames(b), proprio()))         # calibrated, but no reset()
+    raw.reset(texts, frames(b, m))
+    _expect(ValueError, lambda: raw.step(frames(b), proprio(), decision_mask=torch.tensor([True, False, True])))
+    _expect(ValueError, lambda: raw.step(frames(b + 1), torch.randn(b + 1, ds)))
+    _expect(ValueError, lambda: raw.step(frames(b), torch.randn(b, ds + 1)))
+    raw.predictor.set_latent_scale(2.0 * _GAMMA_STAR)                    # gamma* no longer shared
+    _expect(RuntimeError, lambda: raw.step(frames(b), proprio()))
 
-    # Execution prefix: replanning happens exactly when the cursor reaches H_t.
-    pipe = _tiny_pipeline(8, 2)
-    pipe.reset("push the block", torch.randn(b, m, c, h_img, h_img))
-    cursor, horizon_t, chunk = None, None, None
-    for _ in range(40):
-        result = pipe.act(torch.randn(b, c, h_img, h_img), torch.randn(b, 6))
-        expected = torch.ones(b, dtype=torch.bool) if cursor is None else cursor >= horizon_t
-        assert torch.equal(result.replanned, expected)
-        if result.step_output is not None:
-            new = result.step_output
-            chunk = new.action_chunk if chunk is None else torch.where(expected.view(-1, 1, 1), new.action_chunk, chunk)
-            horizon_t = new.executed_horizon if horizon_t is None else torch.where(expected, new.executed_horizon, horizon_t)
-            cursor = torch.zeros(b, dtype=torch.long) if cursor is None else torch.where(expected, torch.zeros_like(cursor), cursor)
-        assert torch.allclose(result.action, chunk[torch.arange(b), cursor])
-        cursor = cursor + 1
+    # ---- Fig. 2 data flow, Eq. 12, Eq. 15, Eq. 9a: step() == a manual run of the same modules.
+    pipe = _tiny_pipeline(16, 2)
+    obs = frames(b)
+    goals = frames(b, m)
+    goals[:, 0] = obs                     # milestone 1 is reached at the first step
+    pipe.reset(texts, goals)
+    du, d = pipe.solver.primitive_embed_dim, pipe.solver.latent_dim
+    with torch.no_grad():
+        c_text = pipe.text_encoder(texts)
+        z_goals = pipe.vision_encoder.encode_milestones(goals)
+    assert torch.equal(pipe.c_text, c_text) and torch.equal(pipe.milestone_latents, z_goals)
+    for step_idx in range(2):             # second step runs at m_t = 2
+        obs_t = obs if step_idx == 0 else frames(b)
+        s_t, xi = proprio(), torch.randn(b, 16, da, generator=gen)
+        m_t = pipe.tracker.m.clone()
+        out = pipe.step(obs_t, s_t, noise=xi)
+        assert torch.equal(out.milestone_pointer, m_t)
+        with torch.no_grad():
+            z_t = pipe.vision_encoder(obs_t)
+            z_g = torch.stack([z_goals[i, int(m_t[i]) - 1] for i in range(b)])   # z_g^(m_t)
+            u_t = pipe.selector.select(z_t, z_g, c_text)
+            pred = pipe.predictor(z_t, u_t)
+            e_t = pipe.solver.build_conditioning(u_t, z_t, pred.z_hat, s_t, c_text)
+            chunk = pipe.solver.generate_chunk(e_t, noise=xi)
+        assert torch.equal(out.z_t, z_t) and torch.equal(out.primitive, u_t)
+        assert torch.equal(out.z_hat, pred.z_hat) and torch.equal(out.sigma, pred.sigma)
+        assert torch.equal(out.conditioning, e_t) and torch.equal(out.action_chunk, chunk)
+        # Eq. 12 inside the pipeline: standardised z_t slot and raw c_text slot.
+        z_ref = (out.z_t.double() - mu_z.double()) / _GAMMA_STAR
+        assert torch.allclose(out.conditioning[:, du:du + d].double(), z_ref, rtol=1e-5, atol=1e-6)
+        assert torch.equal(out.conditioning[:, -c_text.shape[1]:], c_text)
+        # Eq. 15: first step sigma_bar = sigma; H_t vs the float64 floor; executed mask.
+        if step_idx == 0:
+            assert torch.equal(out.sigma_bar, out.sigma)
+        assert out.executed_horizon.tolist() == _ref_horizon(pipe, out.sigma_bar)
+        assert out.executed_mask.tolist() == [[hh < int(out.executed_horizon[i]) for hh in range(16)]
+                                              for i in range(b)]
+        if step_idx == 0:                 # Eq. 9a: identical frame -> distance ~ 0 < tau*, m: 1 -> 2
+            assert bool((out.milestone_distance < 1e-5).all())
+            assert out.next_milestone_pointer.tolist() == [2] * b and not bool(out.task_complete.any())
 
-    # A hidden extra network evaluation on the chain is detected.
-    original = pipe.solver.generate_chunk
+    # ---- Eq. 9a: M = 1 completes the task without moving the pointer.
+    pipe.reset("pick up the block", obs.unsqueeze(1))
+    out = pipe.step(obs, proprio())
+    assert out.next_milestone_pointer.tolist() == [1] * b and bool(out.task_complete.all())
 
-    def leaky(cond: Tensor, noise: Optional[Tensor] = None) -> Tensor:
-        pipe.solver.vector_field(torch.zeros(cond.shape[0], 8, 3), 0.0, cond)
-        return original(cond, noise=noise)
+    # ---- Eq. 9a long rollout against a float64 reference of the pointer rule.
+    num_m = 3
+    pipe = _tiny_pipeline(16, 1)
+    tau = pipe.tracker.threshold
+    goals = frames(b, num_m)
+    pipe.reset(texts, goals)
+    done_prev = [False] * b
+    for _ in range(60):
+        m_t = pipe.tracker.m.clone()
+        obs_t = frames(b)
+        hit = (torch.rand(b, generator=gen) < 0.3).tolist()
+        for i in range(b):
+            if hit[i]:
+                obs_t[i] = goals[i, int(m_t[i]) - 1]
+        out = pipe.step(obs_t, proprio())
+        for i in range(b):
+            g = pipe.milestone_latents[i, int(m_t[i]) - 1].double()
+            dist = math.sqrt(float(((out.z_t[i].double() - g) ** 2).sum()))
+            assert abs(dist - tau) > 1e-5                     # unambiguous side of the strict test
+            reached = dist < tau
+            want = int(m_t[i]) + int(reached and int(m_t[i]) < num_m)
+            assert int(out.next_milestone_pointer[i]) == want
+            assert 1 <= int(m_t[i]) <= want <= num_m       # never decreases, stays in range
+            done_i = done_prev[i] or (reached and int(m_t[i]) == num_m)
+            assert bool(out.task_complete[i]) == done_i     # sticky completion
+            done_prev[i] = done_i
+    assert all(done_prev) and pipe.tracker.m.tolist() == [num_m] * b
 
-    pipe.solver.generate_chunk = leaky  # type: ignore[method-assign]
-    try:
-        pipe.step(torch.randn(b, c, h_img, h_img), torch.randn(b, 6))
-        raise AssertionError("an extra v_theta evaluation must be rejected")
-    except RuntimeError:
-        pass
+    # ---- Execution prefix: per-element replanning in act() against an independent model.
+    pipe = _tiny_pipeline(16, 2, beta=5.0)
+    with torch.no_grad():  # untrained toy latents are nearly identical across frames; spread them so
+        pipe.vision_encoder.head.weight.mul_(10.0)  # sigma, and hence H_t, differs between elements
+    pipe.reset(texts, frames(b, m))
+    chunk_m = horizon_m = cursor_m = sbar_m = None
+    mixed = 0
+    for call in range(60):
+        prev_prefix = pipe.execution_prefix
+        res = pipe.act(frames(b), proprio())
+        expect = torch.ones(b, dtype=torch.bool) if cursor_m is None else cursor_m >= horizon_m
+        assert torch.equal(res.replanned, expect)
+        mixed += int(bool(expect.any()) and not bool(expect.all()))
+        if call == 0:
+            so = res.step_output
+            chunk_m, horizon_m = so.action_chunk.clone(), so.executed_horizon.clone()
+            sbar_m, cursor_m = so.sigma_bar.clone(), torch.zeros(b, dtype=torch.long)
+        elif res.step_output is not None:
+            so = res.step_output
+            for i in range(b):
+                if expect[i]:             # replanned: new chunk, H_t, sigma_bar; cursor restarts
+                    chunk_m[i], horizon_m[i], sbar_m[i], cursor_m[i] = (
+                        so.action_chunk[i], so.executed_horizon[i], so.sigma_bar[i], 0)
+                else:                     # not replanned: everything kept bit-exactly
+                    assert torch.equal(pipe.execution_prefix[0][i], prev_prefix[0][i])
+                    assert int(pipe.execution_prefix[1][i]) == int(prev_prefix[1][i])
+                    assert float(so.sigma_bar[i]) == float(sbar_m[i])
+                    assert int(so.next_milestone_pointer[i]) == int(so.milestone_pointer[i])
+        else:
+            assert res.step_output is None
+        assert torch.equal(pipe.execution_prefix[0], chunk_m) and torch.equal(pipe.execution_prefix[1], horizon_m)
+        assert torch.equal(res.action, chunk_m[torch.arange(b), cursor_m])
+        assert bool(((horizon_m >= 2) & (horizon_m <= 16)).all())
+        cursor_m = cursor_m + 1
+    assert mixed >= 5, mixed
+
+    # ---- Guard: hidden or missing network evaluations raise, and nothing is committed.
+    pipe = _tiny_pipeline(16, 2)
+    pipe.reset(texts, frames(b, m))
+    pipe.step(frames(b), proprio())
+    solver, selector = pipe.solver, pipe.selector
+    gen_chunk, select = solver.generate_chunk, selector.select
+
+    def extra_v(cond: Tensor, noise: Optional[Tensor] = None) -> Tensor:
+        solver.vector_field(torch.zeros(cond.shape[0], 16, da), 0.0, cond)
+        return gen_chunk(cond, noise=noise)
+
+    def missing_v(cond: Tensor, noise: Optional[Tensor] = None) -> Tensor:
+        a = torch.zeros(cond.shape[0], 16, da)
+        return a + solver.vector_field(a, 0.0, cond)        # K - 1 = 1 evaluation instead of 2
+
+    def extra_e(z_t: Tensor, z_goal: Tensor, c_txt: Tensor) -> Tensor:
+        pipe.vision_encoder(torch.zeros(z_t.shape[0], c, h_img, h_img))
+        return select(z_t, z_goal, c_txt)
+
+    for target, attr, patch in ((solver, "generate_chunk", extra_v), (solver, "generate_chunk", missing_v),
+                                (selector, "select", extra_e)):
+        before = _snapshot(pipe)
+        setattr(target, attr, patch)
+        try:
+            _expect(RuntimeError, lambda: pipe.step(frames(b), proprio()))
+        finally:
+            delattr(target, attr)  # restore the class method
+        assert all(torch.equal(x, y) for x, y in zip(before, _snapshot(pipe), strict=True))
+    assert pipe.step(frames(b), proprio()).num_sequential_evaluations == 2 + 3  # restored
     print("pipeline.py self-test passed")
-
 
 if __name__ == "__main__":
     _self_test()
