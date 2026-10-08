@@ -410,42 +410,176 @@ def _toy_tokenizer(texts: Sequence[str], max_length: int = 16, **_: Any) -> dict
     return {"input_ids": ids, "attention_mask": mask}
 
 
+_RTOL, _ATOL = 1e-5, 1e-6  # float32 module output vs float64 reference (CLAUDE.md)
+
+
+def _close(actual: Tensor, ref: Tensor) -> bool:
+    return torch.allclose(actual.double(), ref.double(), rtol=_RTOL, atol=_ATOL)
+
+
+def _expect_value_error(fn: Callable[[], Any]) -> None:
+    try:
+        fn()
+    except ValueError:
+        return
+    raise AssertionError("expected ValueError")
+
+
+def _ref_layer_norm(x: Tensor, weight: Tensor, bias: Tensor, eps: float) -> Tensor:
+    """LayerNorm over the last axis, written out: (x - mean) / sqrt(biased var + eps) * w + b."""
+    mean = x.sum(-1, keepdim=True) / x.shape[-1]
+    var = ((x - mean) ** 2).sum(-1, keepdim=True) / x.shape[-1]
+    return (x - mean) / torch.sqrt(var + eps) * weight + bias
+
+
+def _ref_vit_forward(enc: VisionEncoder, images: Tensor) -> Tensor:
+    """Independent float64 reference of z = E_psi(I) (Eq. 7) for one frame batch ``[B, C, H, W]``.
+
+    Re-derives the ViT forward from its definition with float64 copies of the module weights:
+    explicit patch loops, per-head softmax attention, exact erf-GELU, hand-written LayerNorm.
+    Returns ``[B, d]`` float64.
+    """
+    f64 = {k: v.detach().double() for k, v in enc.state_dict().items()}
+    x = images.double()
+    bsz, _, h, w = x.shape
+    p = enc.patch_embed.patch_size
+    w_patch = f64["patch_embed.proj.weight"].reshape(f64["patch_embed.proj.weight"].shape[0], -1)
+    tokens = []
+    for i in range(h // p):  # row-major patch order
+        for j in range(w // p):
+            patch = x[:, :, i * p:(i + 1) * p, j * p:(j + 1) * p].reshape(bsz, -1)  # [B, C*P*P]
+            tokens.append(patch @ w_patch.T + f64["patch_embed.proj.bias"])
+    t = torch.stack(tokens, dim=1)  # [B, N_patch, D]
+    t = torch.cat([f64["cls_token"].expand(bsz, -1, -1), t], dim=1) + f64["pos_embed"]
+    width = t.shape[-1]
+    for n, block in enumerate(enc.blocks):
+        pre = f"blocks.{n}."
+        heads = block.attn.num_heads
+        dh = width // heads
+        hn = _ref_layer_norm(t, f64[pre + "norm1.weight"], f64[pre + "norm1.bias"], block.norm1.eps)
+        w_in, b_in = f64[pre + "attn.in_proj_weight"], f64[pre + "attn.in_proj_bias"]
+        q = hn @ w_in[:width].T + b_in[:width]
+        k = hn @ w_in[width:2 * width].T + b_in[width:2 * width]
+        v = hn @ w_in[2 * width:].T + b_in[2 * width:]
+        head_out = []
+        for a in range(heads):
+            sl = slice(a * dh, (a + 1) * dh)
+            scores = q[..., sl] @ k[..., sl].transpose(1, 2) / dh ** 0.5  # [B, N, N]
+            e = torch.exp(scores - scores.max(dim=-1, keepdim=True).values)
+            head_out.append((e / e.sum(dim=-1, keepdim=True)) @ v[..., sl])
+        attn = torch.cat(head_out, dim=-1) @ f64[pre + "attn.out_proj.weight"].T + f64[pre + "attn.out_proj.bias"]
+        t = t + attn
+        hn = _ref_layer_norm(t, f64[pre + "norm2.weight"], f64[pre + "norm2.bias"], block.norm2.eps)
+        hid = hn @ f64[pre + "mlp.0.weight"].T + f64[pre + "mlp.0.bias"]
+        hid = 0.5 * hid * (1.0 + torch.erf(hid / 2.0 ** 0.5))  # exact GELU
+        t = t + hid @ f64[pre + "mlp.2.weight"].T + f64[pre + "mlp.2.bias"]
+    t = _ref_layer_norm(t, f64["norm.weight"], f64["norm.bias"], enc.norm.eps)
+    return t[:, 0] @ f64["head.weight"].T + f64["head.bias"]  # [B, d]
+
+
 def _self_test() -> None:
     torch.manual_seed(0)
-    b, m, c, h, w, d = 2, 3, 3, 32, 32, 16
+    gen = torch.Generator().manual_seed(1234)
+    b, m, c, h, w, d = 2, 3, 3, 32, 32, 16  # B != M so a B/M transposition cannot pass
     enc = VisionEncoder(image_size=(h, w), patch_size=8, in_channels=c, width=32, depth=2,
                         num_heads=4, latent_dim=d).eval()
-    obs = torch.randn(b, c, h, w)
-    goals = torch.randn(b, m, c, h, w)
+    obs = torch.randn(b, c, h, w, generator=gen)
+    goals = torch.randn(b, m, c, h, w, generator=gen)
 
-    z_t = enc(obs)
-    assert z_t.shape == (b, d)
-    z_g = enc.encode_milestones(goals)
-    assert z_g.shape == (b, m, d)
-
-    # Siamese batching must equal separate encoding (shared weights, per-sample independence).
-    zs_t, zs_g = enc.encode_siamese(obs, goals)
-    assert torch.allclose(zs_t, z_t, atol=1e-5) and torch.allclose(zs_g, z_g, atol=1e-5)
-
-    # Momentum target: no grad, and EMA update follows psi_bar <- mu*psi_bar + (1-mu)*psi.
-    target = MomentumEncoder(enc, momentum=0.9)
-    assert not any(p.requires_grad for p in target.parameters())
+    # ---- Eq. 7: z_t = E_psi(I_t), z_g^(m) = E_psi(I_g^(m)) against the float64 reference.
     with torch.no_grad():
-        for p in enc.parameters():
-            p.add_(1.0)
-    before = [p.clone() for p in target.encoder.parameters()]
-    target.update(enc)
-    for p_bar_new, p_bar_old, p in zip(target.encoder.parameters(), before, enc.parameters(), strict=True):
-        assert torch.allclose(p_bar_new, 0.9 * p_bar_old + 0.1 * p, atol=1e-6)
-    assert not target(obs).requires_grad
+        z_t = enc(obs)
+        z_g = enc.encode_milestones(goals)
+        zs_t, zs_g = enc.encode_siamese(obs, goals)
+    assert z_t.shape == (b, d) and z_g.shape == (b, m, d)
+    assert zs_t.shape == (b, d) and zs_g.shape == (b, m, d)
+    ref_t = _ref_vit_forward(enc, obs)
+    assert _close(z_t, ref_t)
+    for bi in range(b):
+        for mi in range(m):
+            ref_g = _ref_vit_forward(enc, goals[bi, mi].unsqueeze(0))[0]
+            assert _close(z_g[bi, mi], ref_g)
+            assert _close(zs_g[bi, mi], ref_g)
+    assert _close(zs_t, ref_t)
+    # Siamese batching (one pass, shared psi) == encoding the two streams separately.
+    assert torch.allclose(zs_t, z_t, rtol=_RTOL, atol=_ATOL)
+    assert torch.allclose(zs_g, z_g, rtol=_RTOL, atol=_ATOL)
+    # B = 1: no cross-sample statistics.
+    with torch.no_grad():
+        z1_t, z1_g = enc.encode_siamese(obs[:1], goals[:1])
+    assert z1_t.shape == (1, d) and z1_g.shape == (1, m, d)
+    assert _close(z1_t, ref_t[:1]) and torch.allclose(z1_g, z_g[:1], rtol=_RTOL, atol=_ATOL)
 
-    # Frozen text encoder (offline stand-in with the CLIP interface).
+    # ---- Malformed frames raise ValueError.
+    _expect_value_error(lambda: enc(torch.randn(b, c + 1, h, w)))          # wrong C
+    _expect_value_error(lambda: enc(torch.randn(b, c, h + 8, w)))          # wrong H
+    _expect_value_error(lambda: enc(torch.randn(b, c, h, w + 8)))          # wrong W
+    _expect_value_error(lambda: enc(torch.randn(c, h, w)))                 # 3-D
+    _expect_value_error(lambda: enc(torch.randn(b, m, c, h, w)))           # 5-D into forward
+    _expect_value_error(lambda: enc.encode_milestones(torch.randn(b, c, h, w)))          # 4-D
+    _expect_value_error(lambda: enc.encode_milestones(torch.randn(b, m, c, h, w + 8)))   # frame size
+    _expect_value_error(lambda: enc.encode_siamese(torch.randn(b + 1, c, h, w), goals))  # batch mismatch
+    _expect_value_error(lambda: enc.encode_siamese(torch.randn(c, h, w), goals))         # 3-D obs
+    _expect_value_error(lambda: enc.encode_siamese(obs, torch.randn(b, c, h, w)))        # 4-D milestones
+
+    # ---- Momentum target E_psi_bar (Eq. 11): EMA psi_bar <- mu psi_bar + (1 - mu) psi.
+    mu = 0.9
+    target = MomentumEncoder(enc, momentum=mu)
+    assert not any(p.requires_grad for p in target.parameters())
+    for p_bar, p in zip(target.encoder.parameters(), enc.parameters(), strict=True):
+        assert torch.equal(p_bar, p) and p_bar.data_ptr() != p.data_ptr()  # copy, not alias
+    psi_bar_ref = [p.detach().double().clone() for p in enc.parameters()]
+    for _ in range(5):
+        with torch.no_grad():  # simulated optimizer step on the online encoder
+            for p in enc.parameters():
+                p.add_(0.1 * torch.randn(p.shape, generator=gen))
+        psi_before = [p.detach().clone() for p in enc.parameters()]
+        target.update(enc)
+        for i, p in enumerate(enc.parameters()):
+            psi_bar_ref[i] = mu * psi_bar_ref[i] + (1.0 - mu) * p.detach().double()
+        for p_bar, ref, p, p_old in zip(
+            target.encoder.parameters(), psi_bar_ref, enc.parameters(), psi_before, strict=True
+        ):
+            assert _close(p_bar, ref)
+            assert torch.equal(p, p_old)  # update() never writes to the online encoder
+    # E_psi_bar is the Eq. 7 map evaluated with the EMA weights.
+    assert _close(target(obs), _ref_vit_forward(target.encoder, obs))
+    # Stop-gradient sg(.): no graph from the target branch, gradients only reach psi.
+    obs_g = obs.clone().requires_grad_(True)
+    z_tgt = target(obs_g)
+    assert not z_tgt.requires_grad and z_tgt.grad_fn is None
+    enc.zero_grad(set_to_none=True)
+    loss = ((enc(obs_g) - z_tgt) ** 2).sum()
+    loss.backward()
+    assert all(p.grad is not None for p in enc.parameters())
+    assert all(p.grad is None for p in target.parameters())
+    _expect_value_error(lambda: MomentumEncoder(enc, momentum=1.0))
+    _expect_value_error(lambda: MomentumEncoder(enc, momentum=-0.1))
+
+    # ---- Frozen text encoder c_text in R^{d_c} (offline stand-in with the CLIP interface).
     text = TextEncoderWrapper(text_model=_ToyTextModel(), tokenizer=_toy_tokenizer)
-    text.train()
-    assert not text.text_model.training
-    c_text = text(["move the cup", "throw the cup away"])
-    assert c_text.shape == (2, text.embed_dim) and not c_text.requires_grad
-    assert not torch.allclose(c_text[0], c_text[1])
+    for mode in (None, True):
+        text.train() if mode is None else text.train(mode)
+        assert not text.text_model.training
+        assert not any(mod.training for mod in text.text_model.modules())
+    assert not any(p.requires_grad for p in text.text_model.parameters())
+    texts = ["move the cup", "throw the cup away", "push the block"]
+    with torch.enable_grad():
+        c_text = text(texts)
+        c_one = text("move the cup")
+    assert c_text.shape == (len(texts), text.embed_dim) and c_one.shape == (1, text.embed_dim)
+    assert not c_text.requires_grad and c_text.grad_fn is None
+    tokens = _toy_tokenizer(texts, padding=True, truncation=True, max_length=text.max_length,
+                            return_tensors="pt")
+    with torch.no_grad():
+        direct = text.text_model(input_ids=tokens["input_ids"],
+                                 attention_mask=tokens["attention_mask"]).text_embeds
+    assert torch.equal(c_text, direct)  # wrapper passes ids and mask through unchanged
+    assert torch.allclose(c_one[0], c_text[0], rtol=_RTOL, atol=_ATOL)  # B=1 vs B=3 BLAS rounding
+    for i in range(len(texts)):
+        for j in range(i + 1, len(texts)):
+            assert not torch.allclose(c_text[i], c_text[j])
+    _expect_value_error(lambda: text([]))
     print("perception.py self-test passed")
 
 
