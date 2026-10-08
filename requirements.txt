@@ -1,0 +1,5 @@
+# Direct runtime dependencies of the VPA reference implementation.
+# Tested with Python 3.13 on macOS 15 (Apple M4, arm64), MPS backend (torch.backends.mps).
+# Python >= 3.10 is required (zip(..., strict=True)).
+torch==2.14.1
+transformers==5.19.0
