@@ -468,74 +468,280 @@ class _CountingField(nn.Module):
         return self.field(actions, rho, cond)
 
 
+_RTOL, _ATOL = 1e-5, 1e-6  # float32 module output vs float64 reference (CLAUDE.md)
+
+
+def _close(actual: Any, ref: Any) -> bool:
+    a = torch.as_tensor(actual).detach().double()
+    r = torch.as_tensor(ref).detach().double()
+    return torch.allclose(a, r, rtol=_RTOL, atol=_ATOL)
+
+
+def _expect(exc: type, fn: Any) -> None:
+    try:
+        fn()
+    except exc:
+        return
+    raise AssertionError(f"expected {exc.__name__}")
+
+
+class _ZeroField(nn.Module):
+    """Test stand-in v_theta == 0 (self-test only)."""
+
+    def forward(self, actions: Tensor, rho: Union[float, Tensor], cond: Tensor) -> Tensor:
+        return torch.zeros_like(actions)
+
+
+class _AffineField(nn.Module):
+    """Test stand-in v(A, rho, e) = a A + b rho + reshape(e W), easy to evaluate in float64.
+
+    Shapes: (``[B, H, d_a]``, scalar or ``[B]``, ``[B, d_e]``) -> ``[B, H, d_a]``
+    """
+
+    def __init__(self, horizon: int, action_dim: int, cond_dim: int, generator: torch.Generator) -> None:
+        super().__init__()
+        self.a, self.b = 0.7, 0.3
+        self.register_buffer("w", 0.1 * torch.randn(cond_dim, horizon * action_dim, generator=generator))
+
+    def forward(self, actions: Tensor, rho: Union[float, Tensor], cond: Tensor) -> Tensor:
+        bsz = actions.shape[0]
+        rho_t = torch.as_tensor(rho, dtype=actions.dtype)
+        rho_t = rho_t.expand(bsz) if rho_t.dim() == 0 else rho_t
+        return self.a * actions + self.b * rho_t.view(bsz, 1, 1) + (cond @ self.w).view(actions.shape)
+
+
+class _RecordingField(nn.Module):
+    """Wraps v_theta and records its last input and output (self-test only)."""
+
+    def __init__(self, field: nn.Module) -> None:
+        super().__init__()
+        self.field = field
+        self.record: Optional[Tuple[Tensor, Tensor, Tensor]] = None
+
+    def forward(self, actions: Tensor, rho: Union[float, Tensor], cond: Tensor) -> Tensor:
+        out = self.field(actions, rho, cond)
+        self.record = (actions.detach().clone(), torch.as_tensor(rho).detach().clone(), out)
+        return out
+
+
+def _ref_conditioning(solver: "FlowMatchingSolver", u: Tensor, z_t: Tensor, z_hat: Tensor,
+                      s_t: Tensor, c: Tensor) -> Tensor:
+    """Float64 reference of Eq. 12 with the Sec. 4.5 standardisation, written slot by slot."""
+    du, d, ds, dc = solver.primitive_embed_dim, solver.latent_dim, solver.proprio_dim, solver.text_dim
+    bsz = z_t.shape[0]
+    emb = solver.primitive_embedding.weight.detach().double()
+    mu_z, g = solver.latent_mean.double(), float(solver.gamma_bar_star)
+    mu_s, sd_s = solver.proprio_mean.double(), solver.proprio_std.double()
+    e = torch.zeros(bsz, du + 2 * d + ds + dc, dtype=torch.float64)
+    for k in range(bsz):
+        for j in range(du):
+            e[k, j] = emb[int(u[k]), j]
+        for j in range(d):
+            e[k, du + j] = (float(z_t[k, j]) - float(mu_z[j])) / g
+            e[k, du + d + j] = (float(z_hat[k, j]) - float(mu_z[j])) / g
+        for j in range(ds):
+            e[k, du + 2 * d + j] = (float(s_t[k, j]) - float(mu_s[j])) / float(sd_s[j])
+        for j in range(dc):
+            e[k, du + 2 * d + ds + j] = float(c[k, j])
+    return e
+
+
 def _self_test() -> None:
     torch.manual_seed(0)
+    gen = torch.Generator().manual_seed(99)
     b, nu, du, d, ds, dc, h, da = 3, 4, 5, 6, 7, 8, 10, 2
     field_kwargs = dict(width=32, depth=2, num_heads=4, time_embed_dim=16)
 
-    for k in ALLOWED_INTEGRATION_STEPS:
-        solver = FlowMatchingSolver(nu, du, d, ds, dc, h, da, num_integration_steps=k, **field_kwargs)
-        assert solver.cond_dim == du + 2 * d + ds + dc
-        lat_mean, gamma_star = torch.randn(d), 2.5
-        s_mean, s_std = torch.randn(ds), torch.rand(ds) + 0.5
-        solver.set_standardization_stats(lat_mean, gamma_star, s_mean, s_std)
+    def make(k: int = 2, horizon: int = h) -> FlowMatchingSolver:
+        return FlowMatchingSolver(nu, du, d, ds, dc, horizon, da, num_integration_steps=k, **field_kwargs)
 
-        u = torch.randint(0, nu, (b,))
-        z_t, z_hat, s_t, c = torch.randn(b, d), torch.randn(b, d), torch.randn(b, ds), torch.randn(b, dc)
-        e_t = solver.build_conditioning(u, z_t, z_hat, s_t, c)
-        assert e_t.shape == (b, solver.cond_dim)
-        assert torch.allclose(e_t[:, du:du + d], (z_t - lat_mean) / gamma_star)
-        assert torch.allclose(e_t[:, du + d:du + 2 * d], (z_hat - lat_mean) / gamma_star)
-        assert torch.allclose(e_t[:, du + 2 * d:du + 2 * d + ds], (s_t - s_mean) / s_std)
-        assert torch.equal(e_t[:, -dc:], c)
+    lat_mean, gamma_star = torch.randn(d, generator=gen), 2.5
+    s_mean, s_std = torch.randn(ds, generator=gen), torch.rand(ds, generator=gen) + 0.5
+    u = torch.randint(0, nu, (b,), generator=gen)
+    z_t, z_hat = torch.randn(b, d, generator=gen), torch.randn(b, d, generator=gen)
+    s_t, c = torch.randn(b, ds, generator=gen), torch.randn(b, dc, generator=gen)
 
-        # Euler integration: exactly K evaluations at rho_k = k / K and the closed-form update.
-        counting = _CountingField(solver.vector_field)
-        solver.vector_field = counting
-        xi = torch.randn(b, h, da)
-        with torch.no_grad():
-            chunk = solver.generate_chunk(e_t, noise=xi)
-            ref = xi.clone()
-            for j in range(k):
-                ref = ref + (1.0 / k) * counting.field(ref, j / k, e_t)
-        assert chunk.shape == (b, h, da)
-        assert counting.calls == [j / k for j in range(k)]
-        assert torch.allclose(chunk, ref, atol=1e-6)
-        solver.vector_field = counting.field
+    # ---- Eq. 12 + Sec. 4.5: unified conditioning and standardisation.
+    solver = make()
+    _expect(RuntimeError, lambda: solver.build_conditioning(u, z_t, z_hat, s_t, c))  # stats not set
+    bad_std_zero, bad_std_neg = s_std.clone(), s_std.clone()
+    bad_std_zero[2], bad_std_neg[4] = 0.0, -0.5
+    _expect(ValueError, lambda: solver.set_standardization_stats(lat_mean, gamma_star, s_mean, bad_std_zero))
+    _expect(ValueError, lambda: solver.set_standardization_stats(lat_mean, gamma_star, s_mean, bad_std_neg))
+    _expect(ValueError, lambda: solver.set_standardization_stats(lat_mean, 0.0, s_mean, s_std))
+    _expect(ValueError, lambda: solver.set_standardization_stats(lat_mean, -1.0, s_mean, s_std))
+    _expect(ValueError, lambda: solver.set_standardization_stats(lat_mean[:-1], gamma_star, s_mean, s_std))
+    _expect(ValueError, lambda: solver.set_standardization_stats(lat_mean, gamma_star, s_mean[:-1], s_std))
+    nan_mean = lat_mean.clone()
+    nan_mean[0] = float("nan")
+    _expect(ValueError, lambda: solver.set_standardization_stats(nan_mean, gamma_star, s_mean, s_std))
+    assert not solver.is_calibrated  # rejected statistics were not installed
+    solver.set_standardization_stats(lat_mean, gamma_star, s_mean, s_std)
+    e_t = solver.build_conditioning(u, z_t, z_hat, s_t, c)
+    assert solver.cond_dim == du + 2 * d + ds + dc and e_t.shape == (b, du + 2 * d + ds + dc)
+    ref_e = _ref_conditioning(solver, u, z_t, z_hat, s_t, c)
+    assert torch.equal(e_t[:, :du], solver.primitive_embedding.weight[u])   # Embed(u_t)
+    assert _close(e_t[:, du:du + d], ref_e[:, du:du + d])                    # (z_t - mu_Z) / gamma*
+    assert _close(e_t[:, du + d:du + 2 * d], ref_e[:, du + d:du + 2 * d])    # (z_hat - mu_Z) / gamma*
+    assert _close(e_t[:, du + 2 * d:du + 2 * d + ds], ref_e[:, du + 2 * d:du + 2 * d + ds])  # S_tilde
+    assert torch.equal(e_t[:, -dc:], c)                                      # c_text, not standardised
+    assert _close(e_t, ref_e)
+    _expect(ValueError, lambda: solver.build_conditioning(u, z_t[:, :-1], z_hat, s_t, c))
+    _expect(ValueError, lambda: solver.build_conditioning(u, z_t, z_hat[:-1], s_t, c))
+    _expect(ValueError, lambda: solver.build_conditioning(u, z_t, z_hat, s_t[:, :-1], c))
+    _expect(ValueError, lambda: solver.build_conditioning(u, z_t, z_hat, s_t, c[:, :-1]))
+    _expect(ValueError, lambda: solver.build_conditioning(u[:-1], z_t, z_hat, s_t, c))
+    e_t = e_t.detach()
 
-    # Eq. 14 against a direct computation with a fixed RNG.
-    a_t = torch.randn(b, h, da)
-    gen = torch.Generator().manual_seed(7)
-    loss = solver.flow_matching_loss(a_t, e_t, generator=gen)
-    gen = torch.Generator().manual_seed(7)
-    xi = torch.randn(a_t.shape, generator=gen)
-    rho = torch.rand(b, generator=gen)
-    a_rho = rho.view(b, 1, 1) * a_t + (1 - rho.view(b, 1, 1)) * xi
-    ref_loss = ((solver.vector_field(a_rho, rho, e_t) - (a_t - xi)) ** 2).sum(dim=(1, 2)).mean()
-    assert torch.allclose(loss, ref_loss, atol=1e-6)
+    # ---- Eqs. 13-14: flow-matching loss with a fixed generator.
+    a_true = torch.randn(b, h, da, generator=gen)
+
+    def replay(seed: int) -> Tuple[Tensor, Tensor]:
+        g = torch.Generator().manual_seed(seed)
+        xi_r = torch.randn(a_true.shape, generator=g)   # same draw order as flow_matching_loss
+        return xi_r, torch.rand(b, generator=g)
+
+    real_field = solver.vector_field
+    solver.vector_field = _ZeroField()
+    loss0 = solver.flow_matching_loss(a_true, e_t, generator=torch.Generator().manual_seed(7))
+    xi, rho = replay(7)
+    ref0 = sum(float(a_true[k, i, j] - xi[k, i, j]) ** 2 for k in range(b) for i in range(h) for j in range(da)) / b
+    assert _close(loss0, ref0)
+    rec = _RecordingField(real_field)
+    solver.vector_field = rec
+    loss = solver.flow_matching_loss(a_true, e_t, generator=torch.Generator().manual_seed(7))
+    a_in, rho_in, vel = rec.record
+    vel_ref = vel.detach()  # reference reads values only; the loss keeps its graph
+    assert torch.equal(rho_in, rho) and bool(((rho >= 0) & (rho < 1)).all())
+    a_rho_ref = torch.zeros(b, h, da, dtype=torch.float64)
+    for k in range(b):
+        r = float(rho[k])
+        a_rho_ref[k] = r * a_true[k].double() + (1.0 - r) * xi[k].double()          # Eq. 13
+    assert _close(a_in, a_rho_ref)
+    ref_loss = sum((float(vel_ref[k, i, j]) - (float(a_true[k, i, j]) - float(xi[k, i, j]))) ** 2
+                   for k in range(b) for i in range(h) for j in range(da)) / b      # Eq. 14
+    assert _close(loss, ref_loss)
     loss.backward()
+    assert all(p.grad is not None for p in real_field.parameters())
+    solver.vector_field = real_field
 
-    # Eq. 15 and the fast-attack / slow-release filter.
-    filt = UncertaintyHorizonFilter(h_min=3, h_max=h, beta=1.0, alpha_sigma=0.25)
-    filt.reset(2)
-    sb, ht = filt.update(torch.tensor([0.0, 0.5]))
-    assert torch.allclose(sb, torch.tensor([0.0, 0.5]))                  # first step: sigma_bar = sigma
-    assert torch.equal(ht, torch.tensor([h, max(3, math.floor(h * math.exp(-0.5)))]))
-    sb, _ = filt.update(torch.tensor([2.0, 0.0]))                           # attack / release
-    assert torch.allclose(sb, torch.tensor([2.0, 0.75 * 0.5]))
-    sb, ht = filt.update(torch.tensor([0.0, 0.0]), mask=torch.tensor([True, False]))
-    assert torch.allclose(sb, torch.tensor([1.5, 0.375]))
-    assert torch.equal(ht, torch.tensor([3, max(3, math.floor(h * math.exp(-0.375)))]))
-    mask = executed_prefix_mask(torch.tensor([2, 4]), 5)
-    assert mask.tolist() == [[True, True, False, False, False], [True, True, True, True, False]]
+    # ---- Euler (Sec. 4.4) for every K, against hand-written loops.
+    for k in ALLOWED_INTEGRATION_STEPS:
+        sk = make(k)
+        sk.set_standardization_stats(lat_mean, gamma_star, s_mean, s_std)
+        ek = sk.build_conditioning(u, z_t, z_hat, s_t, c).detach()
+        xi = torch.randn(b, h, da, generator=gen)
+        real_k = sk.vector_field
+        # (a) affine stand-in field vs a float64 Euler loop.
+        affine = _AffineField(h, da, sk.cond_dim, gen)
+        counting = _CountingField(affine)
+        sk.vector_field = counting
+        with torch.no_grad():
+            chunk = sk.generate_chunk(ek, noise=xi)
+        assert counting.calls == [j / k for j in range(k)]
+        a_ref = xi.double()
+        bias = (ek.double() @ affine.w.double()).view(b, h, da)
+        for j in range(k):
+            a_ref = a_ref + (1.0 / k) * (affine.a * a_ref + affine.b * (j / k) + bias)
+        assert chunk.shape == (b, h, da) and _close(chunk, a_ref)
+        # (b) real transformer vs a hand-written float32 loop from the same xi.
+        field = _CountingField(real_k)
+        sk.vector_field = field
+        with torch.no_grad():
+            chunk = sk.generate_chunk(ek, noise=xi)
+            a_loop = xi.clone()
+            for j in range(k):
+                a_loop = a_loop + (1.0 / k) * real_k(a_loop, j / k, ek)
+        assert field.calls == [j / k for j in range(k)] and _close(chunk, a_loop)
+        # (c) noise drawn from a generator == the same noise passed explicitly.
+        with torch.no_grad():
+            c1 = sk.generate_chunk(ek, generator=torch.Generator().manual_seed(11))
+            c2 = sk.generate_chunk(ek, noise=torch.randn(b, h, da, generator=torch.Generator().manual_seed(11)))
+        assert torch.equal(c1, c2)
+        _expect(ValueError, lambda s=sk, e=ek: s.generate_chunk(e, noise=torch.randn(b, h + 1, da)))
+    for bad_k in (0, 4):
+        _expect(ValueError, lambda kk=bad_k: make(kk))
 
-    try:
-        FlowMatchingSolver(nu, du, d, ds, dc, h, da, num_integration_steps=4)
-        raise AssertionError("K outside {1, 2, 3} must be rejected")
-    except ValueError:
-        pass
+    # ---- Horizon independence: K evaluations of v_theta for every H.
+    for hh in (4, 16, 64):
+        for k in ALLOWED_INTEGRATION_STEPS:
+            sk = make(k, horizon=hh)
+            sk.set_standardization_stats(lat_mean, gamma_star, s_mean, s_std)
+            ek = sk.build_conditioning(u, z_t, z_hat, s_t, c).detach()
+            counting = _CountingField(sk.vector_field)
+            sk.vector_field = counting
+            with torch.no_grad():
+                chunk = sk.generate_chunk(ek, generator=torch.Generator().manual_seed(hh + k))
+            assert len(counting.calls) == k and chunk.shape == (b, hh, da)
+
+    # ---- Eq. 15 filter: fast attack, slow release, masked elements frozen.
+    alpha = 0.25
+    seq = [0.0, 0.2, 1.0, 1.0, 1.0, 1.0, 0.3, 0.3, 0.1, 0.0, 0.0, 0.6]  # rise, plateau, decay, rise
+    mask1 = [True, True, False, True, False, True, True, False, True, True, False, True]
+    filt = UncertaintyHorizonFilter(h_min=3, h_max=h, beta=1.0, alpha_sigma=alpha)
+    filt.reset(3)
+    assert torch.equal(filt.sigma_bar, torch.zeros(3))
+    ref_prev = [0.0, 0.0, 0.0]
+    prev_mod = filt.sigma_bar.clone()
+    rises, decays = [], []
+    for t, s in enumerate(seq):
+        sig = [s, s, 0.5 * s]
+        mask = [True, mask1[t], True]
+        sb, ht = filt.update(torch.tensor(sig), mask=torch.tensor(mask))
+        ref = [max(sig[i], (1 - alpha) * ref_prev[i] + alpha * sig[i]) if mask[i] else ref_prev[i]
+               for i in range(3)]
+        assert _close(sb, torch.tensor(ref, dtype=torch.float64))
+        assert torch.equal(ht, filt.horizon(sb))
+        if t == 0:
+            assert float(sb[0]) == float(torch.tensor(s))     # sigma_bar_0 = 0 -> sigma_bar = sigma
+        if sig[0] > ref_prev[0]:                               # rise: applied immediately, bit-exact
+            rises.append(t)
+            assert float(sb[0]) == float(torch.tensor(sig[0]))
+        if sig[0] < ref_prev[0]:                               # decay: gradual, stays above sigma
+            decays.append(t)
+            assert float(sb[0]) > sig[0] and float(sb[0]) < float(prev_mod[0])
+        if not mask[1]:
+            assert float(sb[1]) == float(prev_mod[1])          # masked element keeps its value
+        ref_prev, prev_mod = ref, sb.clone()
+    assert {1, 2, 11} <= set(rises) and {6, 7, 8, 9, 10} <= set(decays)
+    filt.reset(3)
+    assert torch.equal(filt.sigma_bar, torch.zeros(3))
+    instant = UncertaintyHorizonFilter(h_min=3, h_max=h, beta=1.0, alpha_sigma=1.0)
+    instant.reset(1)
+    for s in seq:
+        assert torch.equal(instant.filter(torch.tensor([s])), torch.tensor([s]))
+
+    # ---- Eq. 15 horizon: H_t = max(H_min, floor(H_max exp(-beta sigma_bar))).
+    h_min, beta = 3, 1.0
+    hf = UncertaintyHorizonFilter(h_min=h_min, h_max=h, beta=beta, alpha_sigma=alpha)
+
+    def ref_h(sb_val: float) -> int:
+        return max(h_min, math.floor(h * math.exp(-beta * sb_val)))
+
+    assert hf.horizon(torch.tensor([0.0])).tolist() == [h]          # sigma_bar = 0 -> H_max
+    assert hf.horizon(torch.tensor([50.0])).tolist() == [h_min]     # large sigma_bar -> H_min
+    assert math.floor(h * math.exp(-1.05)) == h_min and math.floor(h * math.exp(-1.3)) == h_min - 1
+    assert hf.horizon(torch.tensor([1.05, 1.3])).tolist() == [h_min, h_min]  # floor = H_min, clamped
+    grid = torch.linspace(0.0, 3.0, 31)[1:]
+    for v in grid.tolist():
+        x = h * math.exp(-beta * v)
+        assert abs(x - round(x)) > 1e-4, v                          # floor is robust to float32
+    ht = hf.horizon(grid)
+    assert ht.dtype == torch.long and ht.tolist() == [ref_h(v) for v in grid.tolist()]
+    assert bool((ht[1:] <= ht[:-1]).all()) and bool(((ht >= h_min) & (ht <= h)).all())
+    hf.reset(len(grid))
+    sb_u, ht_u = hf.update(grid)
+    assert torch.equal(ht_u, hf.horizon(sb_u))
+    h_exec = torch.tensor([h_min, 6, h])
+    pm = executed_prefix_mask(h_exec, h)
+    assert pm.shape == (3, h)
+    assert pm.tolist() == [[step < int(h_exec[i]) for step in range(h)] for i in range(3)]
+    for kw in (dict(h_min=0), dict(h_min=h + 1), dict(beta=0.0), dict(beta=-1.0),
+               dict(alpha_sigma=0.0), dict(alpha_sigma=1.5)):
+        args = dict(h_min=3, h_max=h, beta=1.0, alpha_sigma=0.25)
+        args.update(kw)
+        _expect(ValueError, lambda a=args: UncertaintyHorizonFilter(**a))
     print("solver.py self-test passed")
-
 
 if __name__ == "__main__":
     _self_test()
