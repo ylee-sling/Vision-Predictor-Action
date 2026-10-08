@@ -112,6 +112,47 @@ Don't change these silently. If you change one, update the docstring and say so 
 - The per-milestone time-out (deferred in Sec. 4.2/6) and spectral normalization (optional,
   Sec. 5.3) are intentionally not implemented.
 
+Pipeline and episode semantics:
+
+- The pointer starts at m₀ = 1. At most one milestone advances per decision step; the Eq. 9a test
+  runs only at decision steps, never during chunk execution.
+- Order inside `step`: Eq. 15 filter, then Eq. 9a, both on the same z_t, after the K + 3 chain.
+  Nothing is committed if the depth audit fails.
+- Completion only sets a sticky `task_complete` flag. The step that completes still generates and
+  commits a chunk, and `act` keeps returning actions; ending the episode is the caller's job.
+- Batches replan asynchronously: the networks run on the whole batch, but σ̄, m_t, the chunk, H_t
+  and the cursor are committed only where `decision_mask` is set. The first step must include every
+  element. (The paper describes a single agent.)
+- Ties in Eq. 8 go to the lowest primitive index (`torch.argmax`).
+- `calibrate` freezes only E_ψ and P_ω (Sec. 4.3); selector and solver stay trainable but are put
+  in eval mode.
+- ν is validated (1 ≤ ν ≤ H_min) but unused at inference; it only matters for aligning training
+  targets.
+- The ε of Eq. 9b and Eq. 18 must be the same value. `VPAConfig.vicreg_eps` sets the tracker's ε;
+  build the loss with `VPAInferencePipeline.make_vicreg_loss`, or verify an external one with
+  `check_vicreg_loss`. (`VICRegLoss` can't read `VPAConfig` itself because of module independence.)
+
+Numerics and estimators:
+
+- The ensemble mean ẑ is computed as `ẑ⁽¹⁾ + mean_i(ẑ⁽ⁱ⁾ − ẑ⁽¹⁾)`: the same mean in exact arithmetic,
+  but σ is exactly 0 when all heads agree.
+- Eq. 14 is a one-sample Monte Carlo estimate per batch element: one ξ and one ρ per call, with
+  ρ drawn from `torch.rand`, i.e. [0, 1).
+- S̃ uses a per-dimension σ_S vector; latents use the scalar γ̄* and a per-dimension μ̄_Z.
+- float32 everywhere on the forward path (MPS). So ρ_k = 1/3 is rounded inside v_θ, γ̄ is computed in
+  float32 even for float64 input, and the H_t floor can differ from exact arithmetic by one exactly
+  at an integer boundary.
+
+Architectures the paper leaves open:
+
+- E_ψ: pre-norm ViT; the latent is a linear head on the final LayerNorm'd [CLS] token.
+- E_ψ̄: starts as an exact copy of ψ; buffers are copied, not EMA-averaged (the ViT has none).
+- c_text: CLIP's projected `text_embeds`, not L2-normalized, padded and truncated at 77 tokens.
+- P_ω: N_e GELU-MLP heads, each with its own primitive embedding (N(0,1) init, separate from the
+  solver's Embed in Eq. 12), weights U(±1/√in).
+- v_θ: non-causal pre-norm transformer over the H positions, with a prepended conditioning token
+  plus an additive broadcast of MLP(e_t, time(ρ)); sinusoidal ρ features scaled by 1000.
+
 ## Conventions
 
 - Images are channels-first: `[B, C, H_img, W_img]`. Milestones are `[B, M, C, H_img, W_img]`.
