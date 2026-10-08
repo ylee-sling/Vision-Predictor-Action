@@ -309,53 +309,229 @@ class MilestoneTracker(nn.Module):
 # ---------------------------------------------------------------------------------------------
 # Self-test (run: python selector.py)
 # ---------------------------------------------------------------------------------------------
+_RTOL, _ATOL = 1e-5, 1e-6  # float32 module output vs float64 reference (CLAUDE.md)
+
+
+def _close(actual: Tensor, ref: Tensor) -> bool:
+    return torch.allclose(actual.double(), ref.double(), rtol=_RTOL, atol=_ATOL)
+
+
+def _close_scalar(actual: float, ref: float) -> bool:
+    return abs(actual - ref) <= _ATOL + _RTOL * abs(ref)
+
+
+def _expect(exc: type, fn) -> None:
+    try:
+        fn()
+    except exc:
+        return
+    raise AssertionError(f"expected {exc.__name__}")
+
+
+def _ref_selector_logits(sel: NeuroSymbolicSelector, z_t: Tensor, z_g: Tensor, c: Tensor) -> Tensor:
+    """Float64 reference of the Eq. 8 MLP: input slots written by hand, Linear/exact-GELU by hand."""
+    b, d, dc = z_t.shape[0], z_t.shape[1], c.shape[1]
+    x = torch.zeros(b, 2 * d + dc, dtype=torch.float64)
+    x[:, :d] = z_t.double()
+    x[:, d:2 * d] = z_g.double()
+    x[:, 2 * d:] = c.double()
+    for layer in sel.mlp:
+        if isinstance(layer, nn.Linear):
+            x = x @ layer.weight.detach().double().T + layer.bias.detach().double()
+        else:
+            assert isinstance(layer, nn.GELU) and layer.approximate == "none"
+            x = 0.5 * x * (1.0 + torch.erf(x / math.sqrt(2.0)))
+    return x  # [B, N_u]
+
+
+def _ref_softmax(s: Tensor) -> Tensor:
+    e = torch.exp(s - s.max(dim=-1, keepdim=True).values)
+    return e / e.sum(dim=-1, keepdim=True)
+
+
+def _ref_margin(z: Tensor, eps: float) -> float:
+    """sqrt((1/d) sum_j Var_unbiased(Z_.j) + eps) with explicit float64 sums (Eq. 9b)."""
+    zd = z.double()
+    bsz, d = zd.shape
+    total = 0.0
+    for j in range(d):
+        col = [float(zd[i, j]) for i in range(bsz)]
+        mean = sum(col) / bsz
+        total += sum((v - mean) ** 2 for v in col) / (bsz - 1)
+    return math.sqrt(total / d + eps)
+
+
+def _ref_pointer_step(m, done, z, goals, tau, num_m, mask):
+    """Per-element float64 reference of Eq. 9a (lists in, lists out)."""
+    m_next, done_next, dist, reached = list(m), list(done), [], []
+    for i in range(len(m)):
+        g = goals[i, m[i] - 1].double()
+        dist_i = math.sqrt(float(((z[i].double() - g) ** 2).sum()))
+        hit = dist_i < tau
+        dist.append(dist_i)
+        reached.append(hit)
+        if mask[i]:
+            if hit and m[i] < num_m:
+                m_next[i] = m[i] + 1
+            if hit and m[i] == num_m:
+                done_next[i] = True
+    return m_next, done_next, dist, reached
+
+
 def _self_test() -> None:
     torch.manual_seed(0)
+    gen = torch.Generator().manual_seed(2024)
     b, d, dc, nu, num_m = 4, 8, 6, 5, 3
 
+    # ---- Eq. 8: u_t = argmax pi_phi^h(u | z_t, z_g^(m_t), c_text).
     sel = NeuroSymbolicSelector(d, dc, nu, hidden_dims=(32, 32))
-    z_t, z_g, c = torch.randn(b, d), torch.randn(b, d), torch.randn(b, dc)
+    z_t, z_g = torch.randn(b, d, generator=gen), torch.randn(b, d, generator=gen)
+    c = torch.randn(b, dc, generator=gen)
+    captured = []
+    pre = sel.mlp.register_forward_pre_hook(lambda _m, args: captured.append(args[0].detach().clone()))
     logits = sel(z_t, z_g, c)
-    assert logits.shape == (b, nu)
+    pre.remove()
+    x_in = captured[0]
+    assert x_in.shape == (b, 2 * d + dc)
+    assert torch.equal(x_in[:, :d], z_t) and torch.equal(x_in[:, d:2 * d], z_g)
+    assert torch.equal(x_in[:, 2 * d:], c)
+    ref_logits = _ref_selector_logits(sel, z_t, z_g, c)
+    ref_probs = _ref_softmax(ref_logits)
+    assert logits.shape == (b, nu) and _close(logits, ref_logits)
+    probs = sel.probabilities(z_t, z_g, c)
+    assert _close(probs, ref_probs) and _close(probs.sum(-1), torch.ones(b))
+    top2 = ref_probs.topk(2, dim=-1).values
+    assert bool(((top2[:, 0] - top2[:, 1]) > 1e-4).all())  # no near-ties: argmax is well defined
+    calls = []
+    hook = sel.register_forward_hook(lambda *_: calls.append(1))
     u = sel.select(z_t, z_g, c)
+    hook.remove()
+    assert len(calls) == 1  # one evaluation through __call__ (depth audit)
     assert u.shape == (b,) and u.dtype == torch.long
-    assert torch.equal(u, sel.probabilities(z_t, z_g, c).argmax(-1))
-    loss = sel.loss(logits, torch.randint(0, nu, (b,)))
-    loss.backward()
+    assert torch.equal(u, probs.argmax(-1)) and torch.equal(u, ref_probs.argmax(-1))
+    sel.loss(logits, torch.randint(0, nu, (b,), generator=gen)).backward()
+    _expect(ValueError, lambda: sel(z_t, z_g[:, :-1], c))
+    _expect(ValueError, lambda: sel(z_t[:, :-1], z_g[:, :-1], c))
+    _expect(ValueError, lambda: sel(z_t, z_g, c[:, :-1]))
+    _expect(ValueError, lambda: sel(z_t, z_g, c[:-1]))
+    _expect(ValueError, lambda: NeuroSymbolicSelector(d, dc, 1))
 
-    # Eq. 9b / 9c against a direct computation.
-    tracker = MilestoneTracker(d, kappa=0.2, alpha_gamma=0.5, eps=1e-4)
-    z1, z2 = torch.randn(64, d) * 2.0, torch.randn(64, d) * 3.0
-    inst1 = math.sqrt(z1.double().var(0, unbiased=True).mean().item() + 1e-4)
-    inst2 = math.sqrt(z2.double().var(0, unbiased=True).mean().item() + 1e-4)
-    # Module state is float32 (MPS has no float64); the float64 reference is compared at float32 precision.
-    assert math.isclose(tracker.update_variance_margin(z1), inst1, rel_tol=1e-5)
-    expected = 0.5 * inst1 + 0.5 * inst2
-    assert math.isclose(tracker.update_variance_margin(z2), expected, rel_tol=1e-5)
-    assert math.isclose(tracker.threshold, 0.2 * math.sqrt(2 * d) * expected, rel_tol=1e-5)
-    tau_star = tracker.freeze()
-    try:
-        tracker.update_variance_margin(z1)
-        raise AssertionError("frozen tracker must not update")
-    except RuntimeError:
-        pass
+    # ---- Eq. 9b / 9c: EMA of the variance margin and tau = kappa sqrt(2d) gamma.
+    kappa, eps = 0.2, 1e-4
+    sizes = [2, 3, 5, 16, 64, 2, 7, 32, 4, 128, 9, 2]  # includes the minimum B = 2
+    batches = [torch.randn(n, d, generator=gen) * (0.5 + 3.0 * float(torch.rand(1, generator=gen)))
+               for n in sizes]
+    for alpha, init in ((0.3, None), (0.3, 0.7), (1.0, None)):
+        tracker = MilestoneTracker(d, kappa=kappa, alpha_gamma=alpha, eps=eps, gamma_bar_init=init)
+        if init is None:
+            _expect(RuntimeError, lambda tr=tracker: tr.threshold)      # not calibrated yet
+        else:  # gamma_0 = gamma_bar_init already defines tau_0
+            assert _close_scalar(tracker.threshold, kappa * math.sqrt(2.0 * d) * init)
+        _expect(RuntimeError, lambda tr=tracker: tr.gamma_bar_star)     # not frozen yet
+        gamma_ref = init
+        for n, z in enumerate(batches):
+            inst = _ref_margin(z, eps)
+            gamma_ref = inst if gamma_ref is None else gamma_ref  # gamma_0 := first estimate
+            gamma_ref = (1.0 - alpha) * gamma_ref + alpha * inst
+            if alpha == 1.0:
+                assert gamma_ref == inst
+            if n == 0 and init is not None:
+                assert _close_scalar(gamma_ref, (1.0 - alpha) * init + alpha * inst)
+            ret = tracker.update_variance_margin(z)
+            assert _close_scalar(ret, gamma_ref) and _close_scalar(float(tracker.gamma_bar), gamma_ref)
+            assert _close_scalar(tracker.threshold, kappa * math.sqrt(2.0 * d) * gamma_ref)
+        # B < 2 raises and leaves gamma unchanged.
+        before = float(tracker.gamma_bar)
+        _expect(ValueError, lambda tr=tracker: tr.update_variance_margin(torch.randn(1, d)))
+        _expect(ValueError, lambda tr=tracker: tr.instantaneous_margin(torch.randn(1, d)))
+        _expect(ValueError, lambda tr=tracker: tr.update_variance_margin(torch.randn(4, d + 1)))
+        assert float(tracker.gamma_bar) == before
+        # freeze(): gamma* and tau* = kappa sqrt(2d) gamma*; no further updates.
+        tau_star = tracker.freeze()
+        tau_ref = kappa * math.sqrt(2.0 * d) * gamma_ref
+        assert _close_scalar(tau_star, tau_ref) and _close_scalar(tracker.threshold, tau_ref)
+        assert _close_scalar(tracker.gamma_bar_star, gamma_ref)
+        _expect(RuntimeError, lambda tr=tracker: tr.update_variance_margin(batches[0]))
+        assert float(tracker.gamma_bar) == before and tracker.threshold == tau_star
+    over = MilestoneTracker(d, kappa=kappa, alpha_gamma=0.5, eps=eps)
+    _expect(RuntimeError, over.freeze)  # uncalibrated, no gamma_bar_star given
+    _expect(ValueError, lambda: over.freeze(gamma_bar_star=-1.0))
+    assert _close_scalar(over.freeze(gamma_bar_star=2.5), kappa * math.sqrt(2.0 * d) * 2.5)
 
-    # Eq. 9a: advance only when reached and m < M; completion only at m = M; monotone pointer.
-    goals = torch.randn(b, num_m, d) * 10.0
-    tracker.reset(num_m, b)
-    near_first = goals[:, 0] + 1e-3          # reaches milestone 1 for every element
-    upd = tracker.step(near_first, goals)
-    assert torch.equal(upd.m_t, torch.ones(b, dtype=torch.long))
-    assert torch.equal(upd.m_next, torch.full((b,), 2, dtype=torch.long))
-    far = goals[:, 1] + 1e3                  # far from milestone 2: pointer holds
-    assert torch.equal(tracker.step(far, goals).m_next, torch.full((b,), 2, dtype=torch.long))
-    mask = torch.tensor([True, False, True, False])
-    upd = tracker.step(goals[:, 1], goals, update_mask=mask)  # reached; only masked elements move
-    assert torch.equal(upd.m_next, torch.tensor([3, 2, 3, 2]))
-    upd = tracker.step(goals[:, 2], goals)   # elements 0,2 finish at m = M; 1,3 still on milestone 2
-    assert torch.equal(upd.m_next, torch.tensor([3, 2, 3, 2]))
-    assert torch.equal(upd.task_complete, torch.tensor([True, False, True, False]))
-    assert upd.distance.shape == (b,) and tau_star > 0
+    # ---- Eq. 9a strict boundary: kappa sqrt(2d) = 0.25 * 4 = 1, so tau* = gamma* = 1.5 exactly.
+    tau = 1.5
+    below = float(torch.nextafter(torch.tensor(tau), torch.tensor(0.0)))  # next float32 below tau
+    for mm in (2, 1):  # M = 2: advance test at m < M;  M = 1: completion test at m = M
+        tr = MilestoneTracker(d, kappa=0.25, alpha_gamma=0.5, eps=eps)
+        assert tr.freeze(gamma_bar_star=tau) == tau
+        goals = torch.randn(2, mm, d, generator=gen)
+        goals[..., 0] = 0.0  # offsets along axis 0 are then represented exactly
+        z = goals[:, 0].clone()
+        z[0, 0], z[1, 0] = tau, below
+        tr.reset(mm, 2)
+        upd = tr.step(z, goals)
+        assert upd.distance[0].item() == tau and upd.distance[1].item() == below  # exact distances
+        assert upd.reached.tolist() == [False, True]
+        if mm == 2:
+            assert upd.m_next.tolist() == [1, 2] and upd.task_complete.tolist() == [False, False]
+        else:  # single-stage task: completes without moving the pointer
+            assert upd.m_next.tolist() == [1, 1] and upd.task_complete.tolist() == [False, True]
+
+    # ---- Eq. 9a randomized run against the per-element reference (tau* = 1.5).
+    tr = MilestoneTracker(d, kappa=0.25, alpha_gamma=0.5, eps=eps)
+    tr.freeze(gamma_bar_star=tau)
+    goals = torch.randn(b, num_m, d, generator=gen) * 5.0
+    goals[..., 0] = 0.0
+    tr.reset(num_m, b)
+    m_ref, done_ref = [1] * b, [False] * b
+    seen = {"advance": 0, "hold": 0, "complete": 0, "masked_reach": 0, "boundary": 0}
+    for _ in range(40):
+        kinds = torch.randint(0, 3, (b,), generator=gen).tolist()  # 0 inside, 1 outside, 2 boundary
+        mask = (torch.rand(b, generator=gen) < 0.7).tolist()
+        z = torch.empty(b, d)
+        for i in range(b):
+            g = goals[i, m_ref[i] - 1]
+            if kinds[i] == 2:
+                z[i] = g
+                z[i, 0] = tau
+            else:
+                direction = torch.randn(d, generator=gen)
+                radius = 0.7 if kinds[i] == 0 else 4.0
+                z[i] = g + radius * direction / direction.norm()
+        assert torch.equal(tr.active_goal(goals), torch.stack([goals[i, m_ref[i] - 1] for i in range(b)]))
+        m_next_ref, done_next_ref, dist_ref, reached_ref = _ref_pointer_step(
+            m_ref, done_ref, z, goals, tau, num_m, mask)
+        upd = tr.step(z, goals, update_mask=torch.tensor(mask))
+        assert upd.m_t.tolist() == m_ref and upd.m_next.tolist() == m_next_ref
+        assert upd.reached.tolist() == reached_ref and upd.task_complete.tolist() == done_next_ref
+        assert _close(upd.distance, torch.tensor(dist_ref, dtype=torch.float64))
+        assert torch.equal(tr.m, upd.m_next) and torch.equal(tr.task_complete, upd.task_complete)
+        for i in range(b):
+            assert m_ref[i] <= m_next_ref[i] <= num_m and m_next_ref[i] >= 1   # monotone, in range
+            assert not done_ref[i] or done_next_ref[i]                         # sticky completion
+            if not mask[i]:
+                assert m_next_ref[i] == m_ref[i] and done_next_ref[i] == done_ref[i]
+                seen["masked_reach"] += int(reached_ref[i])
+            seen["advance"] += int(m_next_ref[i] > m_ref[i])
+            seen["hold"] += int(mask[i] and m_next_ref[i] == m_ref[i])
+            seen["complete"] += int(done_next_ref[i] and not done_ref[i])
+            seen["boundary"] += int(kinds[i] == 2 and not reached_ref[i])
+        m_ref, done_ref = m_next_ref, done_next_ref
+    assert all(v > 0 for v in seen.values()), seen
+    assert all(done_ref)  # every element completed and stayed complete
+
+    # ---- Errors: pointer before reset(), bad constructor / reset arguments.
+    fresh = MilestoneTracker(d, kappa=0.25, alpha_gamma=0.5, eps=eps)
+    fresh.freeze(gamma_bar_star=1.0)
+    _expect(RuntimeError, lambda: fresh.step(torch.randn(b, d), goals))
+    _expect(RuntimeError, lambda: fresh.active_goal(goals))
+    _expect(RuntimeError, lambda: fresh.completion_test(torch.randn(b, d), goals))
+    _expect(ValueError, lambda: fresh.reset(0, b))
+    for kw in (dict(kappa=0.0), dict(kappa=1.0), dict(alpha_gamma=0.0), dict(alpha_gamma=1.5),
+               dict(eps=0.0), dict(gamma_bar_init=0.0), dict(gamma_bar_init=-1.0)):
+        args = dict(kappa=0.25, alpha_gamma=0.5, eps=eps)
+        args.update(kw)
+        _expect(ValueError, lambda a=args: MilestoneTracker(d, **a))
     print("selector.py self-test passed")
 
 
