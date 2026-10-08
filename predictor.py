@@ -175,14 +175,19 @@ class JEPAPredictor(nn.Module):
     def forward(self, z_t: Tensor, u_t: Tensor) -> PredictorOutput:
         """Eq. 10: (z_hat_{t+1}, sigma_{t+1}) = P_omega(z_t, u_t).
 
+        The ensemble mean z_hat = (1/N_e) sum_i z_hat^(i) (Sec. 4.3) is evaluated relative to head 1,
+        z_hat = z_hat^(1) + (1/N_e) sum_i (z_hat^(i) - z_hat^(1)), which is the same mean in exact
+        arithmetic. In float32 it returns z_hat bit-exactly when all heads agree, so sigma = 0
+        exactly for identical heads; a plain float32 mean of N_e equal values can be off by one ulp.
+
         Args:
             z_t: ``[B, d]``;  u_t: ``[B]`` int64.
 
         Returns:
             ``PredictorOutput(z_hat [B, d], sigma [B], head_predictions [N_e, B, d])``.
         """
-        heads = self.forward_heads(z_t, u_t)  # [N_e, B, d]
-        z_hat = heads.mean(dim=0)             # [B, d]
+        heads = self.forward_heads(z_t, u_t)                       # [N_e, B, d]
+        z_hat = heads[0] + (heads - heads[0:1]).mean(dim=0)        # [B, d]  ensemble mean (Sec. 4.3)
         return PredictorOutput(z_hat, self.ensemble_uncertainty(heads, z_hat), heads)
 
 
@@ -304,59 +309,220 @@ class VICRegLoss(nn.Module):
 # ---------------------------------------------------------------------------------------------
 # Self-test (run: python predictor.py)
 # ---------------------------------------------------------------------------------------------
+_RTOL, _ATOL = 1e-5, 1e-6  # float32 module output vs float64 reference (CLAUDE.md)
+
+
+def _close(actual, ref) -> bool:
+    a = torch.as_tensor(actual).detach().double()
+    r = torch.as_tensor(ref).detach().double()
+    return torch.allclose(a, r, rtol=_RTOL, atol=_ATOL)
+
+
+def _expect(exc: type, fn) -> None:
+    try:
+        fn()
+    except exc:
+        return
+    raise AssertionError(f"expected {exc.__name__}")
+
+
+def _ref_head_forward(pred: JEPAPredictor, z_t: Tensor, u_t: Tensor) -> Tensor:
+    """Float64 per-head, per-sample reference of the ensemble heads (Eq. 10) -> ``[N_e, B, d]``."""
+    ne, (b, d) = pred.num_heads, z_t.shape
+    emb = pred.primitive_embedding.detach().double()
+    out = torch.zeros(ne, b, d, dtype=torch.float64)
+    for i in range(ne):
+        for k in range(b):
+            x = torch.cat([z_t[k].double(), emb[i, int(u_t[k])]])  # head i's own embedding row
+            for layer in pred.heads:
+                if isinstance(layer, EnsembleLinear):
+                    x = x @ layer.weight[i].detach().double() + layer.bias[i, 0].detach().double()
+                else:
+                    assert isinstance(layer, nn.GELU) and layer.approximate == "none"
+                    x = 0.5 * x * (1.0 + torch.erf(x / math.sqrt(2.0)))
+            out[i, k] = x
+    return out
+
+
+def _ref_sigma(heads: Tensor, gamma_star: float) -> Tensor:
+    """sqrt((1/N_e) sum_i ||z_i - z_bar||^2) / (sqrt(d) gamma*) with explicit loops -> ``[B]``."""
+    ne, b, d = heads.shape
+    h = heads.detach().double()
+    sig = torch.zeros(b, dtype=torch.float64)
+    for k in range(b):
+        mean = [sum(float(h[i, k, j]) for i in range(ne)) / ne for j in range(d)]
+        sq = sum((float(h[i, k, j]) - mean[j]) ** 2 for i in range(ne) for j in range(d))
+        sig[k] = math.sqrt(sq / ne) / (math.sqrt(d) * gamma_star)
+    return sig
+
+
+def _ref_column_var(z: Tensor) -> list:
+    """Unbiased per-column variance with explicit float64 sums."""
+    zd = z.detach().double()
+    b, d = zd.shape
+    out = []
+    for j in range(d):
+        col = [float(zd[k, j]) for k in range(b)]
+        mean = sum(col) / b
+        out.append(sum((v - mean) ** 2 for v in col) / (b - 1))
+    return out
+
+
+def _ref_v(z: Tensor, gamma: float, eps: float) -> float:
+    """Eq. 18 with loops."""
+    var = _ref_column_var(z)
+    return sum(max(0.0, gamma - math.sqrt(v + eps)) for v in var) / len(var)
+
+
+def _ref_cov_matrix(z: Tensor) -> Tensor:
+    """C(Z) = 1/(B-1) sum_b (Z_b - Zbar)(Z_b - Zbar)^T with a triple loop (Eq. 19)."""
+    zd = z.detach().double()
+    b, d = zd.shape
+    mean = [sum(float(zd[k, j]) for k in range(b)) / b for j in range(d)]
+    c = torch.zeros(d, d, dtype=torch.float64)
+    for i in range(d):
+        for j in range(d):
+            c[i, j] = sum((float(zd[k, i]) - mean[i]) * (float(zd[k, j]) - mean[j]) for k in range(b)) / (b - 1)
+    return c
+
+
+def _ref_c(z: Tensor) -> float:
+    """Eq. 19 with loops."""
+    c = _ref_cov_matrix(z)
+    d = c.shape[0]
+    return sum(float(c[i, j]) ** 2 for i in range(d) for j in range(d) if i != j) / d
+
+
+def _ref_invariance(heads: Tensor, target: Tensor, reduction: str) -> float:
+    """Eq. 11 prediction term per head (squared norm over d, mean over B), then mean/sum over heads."""
+    h, t = heads.detach().double(), target.detach().double()
+    ne, b, d = h.shape
+    per_head = [sum(sum((float(h[i, k, j]) - float(t[k, j])) ** 2 for j in range(d)) for k in range(b)) / b
+                for i in range(ne)]
+    return sum(per_head) / ne if reduction == "mean" else sum(per_head)
+
+
 def _self_test() -> None:
     torch.manual_seed(0)
+    gen = torch.Generator().manual_seed(4321)
     b, d, nu, ne = 32, 8, 4, 5
     pred = JEPAPredictor(d, nu, num_heads=ne, primitive_embed_dim=6, hidden_dim=32, num_hidden_layers=2)
-    z_t, u_t = torch.randn(b, d), torch.randint(0, nu, (b,))
+    z_t = torch.randn(b, d, generator=gen)
+    u_t = torch.randint(0, nu, (b,), generator=gen)
 
+    # ---- Eq. 10 ensemble: each head is its own network.
     heads = pred.forward_heads(z_t, u_t)
     assert heads.shape == (ne, b, d)
-    # Heads are independent networks: head i must equal a loop over its own parameters.
+    ref_heads = _ref_head_forward(pred, z_t, u_t)
+    assert _close(heads, ref_heads)
+    linears = [layer for layer in pred.heads if isinstance(layer, EnsembleLinear)]
     for i in range(ne):
-        x = torch.cat([z_t, pred.primitive_embedding[i, u_t]], dim=-1)
-        for layer in pred.heads:
-            x = x @ layer.weight[i] + layer.bias[i] if isinstance(layer, EnsembleLinear) else layer(x)
-        assert torch.allclose(x, heads[i], atol=1e-5)
-    assert not torch.allclose(heads[0], heads[1])  # independent initialisations
+        for j in range(i + 1, ne):
+            assert not torch.equal(linears[0].weight[i], linears[0].weight[j])
+            assert float((heads[i] - heads[j]).detach().abs().max()) > 1e-3  # independent initialisations
+    _expect(ValueError, lambda: pred.forward_heads(z_t[:, :-1], u_t))
+    _expect(ValueError, lambda: pred.forward_heads(z_t.unsqueeze(0), u_t))
+    _expect(ValueError, lambda: pred.forward_heads(z_t, u_t[:-1]))
 
-    try:
-        pred(z_t, u_t)
-        raise AssertionError("sigma must require gamma*")
-    except RuntimeError:
-        pass
+    # ---- sigma (Sec. 4.3): requires gamma*.
+    _expect(RuntimeError, lambda: pred(z_t, u_t))
+    for bad in (0.0, -1.0, float("nan")):
+        _expect(ValueError, lambda g=bad: pred.set_latent_scale(g))
     gamma_star = 1.7
     pred.set_latent_scale(gamma_star)
     out = pred(z_t, u_t)
     assert out.z_hat.shape == (b, d) and out.sigma.shape == (b,)
-    ref = torch.stack([
-        torch.sqrt(sum(((heads[i, k] - heads[:, k].mean(0)) ** 2).sum() for i in range(ne)) / ne)
-        / (math.sqrt(d) * gamma_star)
-        for k in range(b)
-    ])
-    assert torch.allclose(out.sigma, ref, atol=1e-5) and bool((out.sigma >= 0).all())
+    assert torch.equal(out.head_predictions, heads)
+    ref_mean = torch.zeros(b, d, dtype=torch.float64)
+    for i in range(ne):
+        ref_mean += ref_heads[i]
+    assert _close(out.z_hat, ref_mean / ne)
+    assert _close(out.sigma, _ref_sigma(ref_heads, gamma_star)) and bool((out.sigma >= 0).all())
+    # Identical heads: zero disagreement.
+    same = JEPAPredictor(d, nu, num_heads=ne, primitive_embed_dim=6, hidden_dim=32, num_hidden_layers=2)
+    with torch.no_grad():
+        same.primitive_embedding.copy_(same.primitive_embedding[0:1].expand_as(same.primitive_embedding))
+        for layer in same.heads:
+            if isinstance(layer, EnsembleLinear):
+                layer.weight.copy_(layer.weight[0:1].expand_as(layer.weight))
+                layer.bias.copy_(layer.bias[0:1].expand_as(layer.bias))
+    same.set_latent_scale(gamma_star)
+    out_same = same(z_t, u_t)
+    for i in range(1, ne):
+        assert torch.equal(out_same.head_predictions[i], out_same.head_predictions[0])
+    assert torch.equal(out_same.sigma, torch.zeros(b)), float(out_same.sigma.abs().max())
 
-    # VICReg terms against direct formulas.
-    crit = VICRegLoss(lambda_v=25.0, lambda_c=1.0, gamma=1.0, eps=1e-4)
-    z = torch.randn(b, d) * 0.5
-    std = torch.sqrt(z.var(0, unbiased=True) + 1e-4)
-    assert torch.allclose(crit.variance(z), torch.clamp(1.0 - std, min=0).mean())
-    zc = z - z.mean(0)
-    cov = sum(torch.outer(zc[k], zc[k]) for k in range(b)) / (b - 1)
-    off = sum(cov[i, j] ** 2 for i in range(d) for j in range(d) if i != j) / d
-    assert torch.allclose(crit.covariance(z), off, atol=1e-6)
-    # Collapsed batch: v = gamma - sqrt(eps), c = 0  (Prop. 5.2 (i)).
-    zeta = torch.ones(b, d) * 3.0
-    assert torch.allclose(crit.variance(zeta), torch.tensor(1.0 - math.sqrt(1e-4)))
-    assert torch.allclose(crit.covariance(zeta), torch.tensor(0.0))
+    # ---- Eq. 18 / Eq. 19 against loop references.
+    gamma, eps, lam_v, lam_c = 1.0, 1e-4, 25.0, 1.0
+    crit = VICRegLoss(lambda_v=lam_v, lambda_c=lam_c, gamma=gamma, eps=eps)
+    z = torch.randn(b, d, generator=gen) * torch.linspace(0.2, 2.0, d)  # some columns below the margin
+    var_cols = _ref_column_var(z)
+    assert any(math.sqrt(v + eps) < gamma for v in var_cols) and any(math.sqrt(v + eps) > gamma for v in var_cols)
+    assert _close(crit.variance(z), _ref_v(z, gamma, eps))
+    assert _close(crit.covariance(z), _ref_c(z))
+    mix = torch.randn(d, d, generator=gen)
+    z_corr = torch.randn(b, d, generator=gen) @ mix  # correlated columns: c clearly > 0
+    assert _ref_c(z_corr) > 0.1 and _close(crit.covariance(z_corr), _ref_c(z_corr))
+    assert _close(crit.variance(z_corr), _ref_v(z_corr, gamma, eps))
+    # Unbiased estimator: for B = 2, Var = (a - b)^2 / 2 (biased would be / 4).
+    z2 = torch.randn(2, d, generator=gen) * 0.3
+    v2 = sum(max(0.0, gamma - math.sqrt(float(z2[0, j] - z2[1, j]) ** 2 / 2 + eps)) for j in range(d)) / d
+    assert _close(crit.variance(z2), v2)
 
-    target = torch.randn(b, d, requires_grad=True)
-    total, terms = crit(z_t, out.head_predictions, target)
-    inv = ((out.head_predictions - target.detach()) ** 2).sum(-1).mean(-1).mean()
-    assert torch.allclose(terms["invariance"], inv.detach())
-    assert torch.allclose(total, inv + 25.0 * crit.variance(z_t) + crit.covariance(z_t))
-    total.backward()
-    assert target.grad is None  # stop-gradient on the target branch
+    # ---- Prop. 5.2 (i): constant encoder -> v = gamma - sqrt(eps), c = 0, L_const = lambda_v (gamma - sqrt(eps)).
+    for zeta in (torch.randn(d, generator=gen), torch.full((d,), 3.0)):
+        zc = zeta.expand(b, d).clone()
+        assert _close(crit.variance(zc), gamma - math.sqrt(eps))
+        assert _close(crit.covariance(zc), 0.0)
+        assert _close(crit.anti_collapse(zc), lam_v * (gamma - math.sqrt(eps)))
+
+    # ---- Prop. 5.2 (ii): whitened batch with B > d -> v = 0, c = 0, C positive definite.
+    raw = torch.randn(b, d, generator=gen, dtype=torch.float64)
+    q, _ = torch.linalg.qr(raw - raw.mean(dim=0, keepdim=True))       # orthonormal, zero-mean columns
+    s = gamma * (1.5 + 1.5 * torch.rand(d, generator=gen, dtype=torch.float64))
+    z_white = (math.sqrt(b - 1) * q * s).float()                      # C = diag(s^2)
+    assert _close(crit.variance(z_white), 0.0) and _close(crit.covariance(z_white), 0.0)
+    eig = torch.linalg.eigvalsh(_ref_cov_matrix(z_white))
+    assert bool((eig > 0).all()) and bool((eig >= gamma ** 2 - eps).all())
+    # B > d is necessary: with B = d, rank C <= B - 1 < d.
+    eig_bd = torch.linalg.eigvalsh(_ref_cov_matrix(torch.randn(d, d, generator=gen)))
+    assert float(eig_bd.abs().min()) < 1e-10
+
+    # ---- Eq. 11: total = invariance + lambda_v v + lambda_c c; stop-gradient on the target.
+    for reduction in ("mean", "sum"):
+        crit_r = VICRegLoss(lambda_v=lam_v, lambda_c=lam_c, gamma=gamma, eps=eps, head_reduction=reduction)
+        pred.zero_grad(set_to_none=True)
+        z_on = z_t.clone().requires_grad_(True)
+        target = torch.randn(b, d, generator=gen).requires_grad_(True)
+        hp = pred(z_on, u_t).head_predictions
+        total, terms = crit_r(z_on, hp, target)
+        inv_ref = _ref_invariance(hp, target, reduction)
+        v_ref, c_ref = _ref_v(z_on, gamma, eps), _ref_c(z_on)
+        assert _close(terms["invariance"], inv_ref)
+        assert _close(terms["variance"], v_ref) and _close(terms["covariance"], c_ref)
+        assert _close(total, inv_ref + lam_v * v_ref + lam_c * c_ref)
+        assert all(t.grad_fn is None for t in terms.values())
+        total.backward()
+        assert target.grad is None                                    # sg(.)
+        assert z_on.grad is not None
+        assert all(p.grad is not None for p in pred.parameters())
+    # Single predictor [B, d] is the N_e = 1 case.
+    assert _close(crit.invariance(heads[0], z_t), _ref_invariance(heads[:1], z_t, "mean"))
+
+    # ---- Errors.
+    for kw in (dict(eps=1.0), dict(eps=2.0), dict(eps=0.0), dict(gamma=0.0), dict(gamma=-1.0),
+               dict(lambda_v=0.0), dict(lambda_v=-1.0), dict(lambda_c=-0.1), dict(head_reduction="max")):
+        args = dict(lambda_v=1.0, lambda_c=1.0, gamma=1.0, eps=1e-4)
+        args.update(kw)
+        _expect(ValueError, lambda a=args: VICRegLoss(**a))
+    one = torch.randn(1, d)
+    _expect(ValueError, lambda: crit.variance(one))
+    _expect(ValueError, lambda: crit.covariance(one))
+    _expect(ValueError, lambda: crit(one, one, one))
+    _expect(ValueError, lambda: crit.variance(torch.randn(2, b, d)))
+    _expect(ValueError, lambda: crit.invariance(heads, z_t[:-1]))
+    _expect(ValueError, lambda: JEPAPredictor(d, nu, num_heads=1))
+    _expect(ValueError, lambda: JEPAPredictor(d, nu, num_hidden_layers=0))
     print("predictor.py self-test passed")
 
 
