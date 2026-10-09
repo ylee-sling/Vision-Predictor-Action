@@ -39,4 +39,3 @@ runs/
 eval_results/
 MUJOCO_LOG.TXT
 *.log
-EOF
