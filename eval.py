@@ -309,6 +309,20 @@ class DemoMilestones:
         }
         return ds.milestone_frames(episode).unsqueeze(0), record
 
+    def init_state(self, suite: Any, task_id: int, task: Any, trial: int) -> Tuple[np.ndarray, str]:
+        """First recorded simulator state of the demonstration used for this trial's milestones.
+
+        The same demonstration as ``frames`` (trial mod N, or ``fixed_demo``), so with
+        ``--init-from-demo`` a trial starts where its milestone demonstration started.
+        """
+        ds = self._dataset(suite, task_id, task)
+        episode = (self.fixed_demo if self.fixed_demo is not None else trial) % len(ds.episodes)
+        ep = ds.episodes[episode]
+        group = ds._file(ep.path)["data"][ep.demo]
+        if "states" not in group:
+            raise KeyError(f"{ep.path}/{ep.demo} has no 'states'; --init-from-demo needs LIBERO's recorded states")
+        return np.asarray(group["states"][0]), f"{os.path.basename(ep.path)}/{ep.demo}"
+
     def release(self, task_id: int) -> None:
         ds = self._cache.pop(task_id, None)
         if ds is not None:
@@ -513,6 +527,27 @@ class EpisodeContext:
     record_video: bool = False
     rotate_view: bool = True
     fixed_horizon: Optional[int] = None   # ablation: execute this many actions instead of H_t (Eq. 15)
+    blind_views: Tuple[int, ...] = ()     # sanity test: these views of I_t are replaced by black frames
+
+
+def blind_frame(frame: Tensor, blind_views: Sequence[int], num_views: int) -> Tensor:
+    """Black out views of an observation batch (sanity test of how much the policy uses each camera).
+
+    Args:
+        frame: ``[B, C, H_img, W_img]`` (one camera) or ``[B, V, C, H_img, W_img]``.
+        blind_views: view indices to replace by zeros (black, since frames are scaled to [0, 1]).
+        num_views: V.
+
+    Returns:
+        a new tensor of the same shape; ``frame`` itself is not modified.
+    """
+    if not blind_views:
+        return frame
+    if num_views == 1:
+        return torch.zeros_like(frame)
+    out = frame.clone()
+    out[:, list(blind_views)] = 0.0
+    return out
 
 
 @torch.no_grad()
@@ -571,6 +606,7 @@ def run_episode(
     primitives: Counter = Counter()
     while env_steps < ctx.max_steps and not success:
         frame = ctx.preprocess.views(obs, ctx.camera_obs_keys).unsqueeze(0).to(ctx.device)   # [1, *frame_shape]
+        frame = blind_frame(frame, ctx.blind_views, len(ctx.camera_obs_keys))                # sanity test only
         state = torch.from_numpy(proprio_from_obs(obs, ctx.proprio_keys)).unsqueeze(0).to(ctx.device)  # [1, d_s]
         noise = torch.randn((1, horizon, action_dim), generator=generator).to(ctx.device)     # xi
         _synchronize(ctx.device)
@@ -735,6 +771,14 @@ def evaluate(
     if len(camera_keys) != cfg.num_views:
         raise ValueError(f"the checkpoint records cameras {list(camera_keys)} but its model has "
                          f"num_views = {cfg.num_views}")
+    blind_cameras: List[str] = []
+    if args.blind_cameras:
+        blind_cameras = list(camera_keys) if "all" in args.blind_cameras else list(dict.fromkeys(args.blind_cameras))
+        not_used = [k for k in blind_cameras if k not in camera_keys]
+        if not_used:
+            raise ValueError(f"--blind-cameras {not_used}: the checkpoint uses the cameras {list(camera_keys)}")
+    if args.init_from_demo and args.milestone_source != "demo":
+        raise ValueError("--init-from-demo needs --milestone-source demo (the start state comes from that demonstration)")
     proprio_keys = list(data_info["proprio_keys"])
     unknown = [k for k in proprio_keys if k not in PROPRIO_FROM_OBS]
     if unknown:
@@ -750,6 +794,7 @@ def evaluate(
         record_video=args.save_video,
         rotate_view=rotate,
         fixed_horizon=args.fixed_horizon,
+        blind_views=tuple(camera_keys.index(k) for k in blind_cameras),
     )
 
     # ---- benchmark
@@ -805,6 +850,8 @@ def evaluate(
         "min_horizon": hf.h_min,
         "max_horizon": hf.h_max,
         "fixed_horizon": args.fixed_horizon,
+        "blind_cameras": blind_cameras,
+        "init_from_demo": bool(args.init_from_demo),
         "rotate_180": rotate,
         "camera_keys": list(camera_keys),
         "num_views": len(camera_keys),
@@ -844,9 +891,13 @@ def evaluate(
                             logger.warning("milestone demonstration instruction %r differs from the task's %r",
                                            source["instruction"], instruction)
                     init_index = trial % len(init_states)
+                    init_state, init_from = init_states[init_index], f"LIBERO init state {init_index}"
+                    if args.init_from_demo:
+                        assert milestone_source is not None
+                        init_state, init_from = milestone_source.init_state(suite, task_id, task, trial)
                     try:
                         record, frames = run_episode(pipe, env, ctx, instruction=instruction,
-                                                     init_state=init_states[init_index], milestones=milestones,
+                                                     init_state=init_state, milestones=milestones,
                                                      generator=generator)
                     except EnvironmentStepError as exc:  # simulator failure: a failed trial, fresh environment
                         logger.exception("task %d trial %d: environment error", task_id, trial)
@@ -856,6 +907,8 @@ def evaluate(
                         env = env_factory(task)
                     record.update({"trial": trial, "init_state_index": init_index, "seed": episode_seed,
                                    "milestones_from": source})
+                    if args.init_from_demo:
+                        record["init_state_from"] = init_from
                     if args.save_video and frames:
                         tag = "success" if record["success"] else "failure"
                         record["video"] = save_video(
@@ -982,6 +1035,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-horizon", type=int, help="override H_min of Eq. 15 (nu <= H_min <= H_max)")
     p.add_argument("--fixed-horizon", type=int,
                    help="ablation: execute this many actions per decision instead of H_t (Eq. 15 bypassed)")
+    p.add_argument("--blind-cameras", nargs="+", metavar="KEY",
+                   help="sanity test: replace these camera views of I_t by black frames at every decision step "
+                        "(milestone frames unchanged); 'all' blinds every camera of the checkpoint")
+    p.add_argument("--init-from-demo", action="store_true",
+                   help="sanity test: start each trial from the first recorded state of its milestone demonstration "
+                        "(with --milestone-demo N: always demonstration N) instead of LIBERO's initial states")
     p.add_argument("--suggest-beta", metavar="EVAL_METRICS_JSON",
                    help="print beta values from the per-step sigma of a finished run, then exit")
     p.add_argument("--rotate", choices=("checkpoint", "on", "off"), default="checkpoint",
@@ -1355,6 +1414,42 @@ def _self_test() -> None:
         evaluate(parse2(["--out", os.path.join(tmp, "eval_two_initial"), "--milestone-source", "initial",
                          "--task-ids", "1"]), suite=suite, env_factory=factory, pipe=pipe2)
         assert len(resets2) == 2 and all(ms.shape == (1, 1, 2, *demo2[0].image_shape) for ms in resets2)
+
+        # ---- sanity options: --blind-cameras (black views of I_t, milestones unchanged) and --init-from-demo
+        envs.clear()
+        calls2.clear()
+        resets2.clear()
+        res_blind = evaluate(parse2(["--out", os.path.join(tmp, "eval_blind"), "--task-ids", "0",
+                                     "--blind-cameras", "agentview_rgb"]), suite=suite, env_factory=factory, pipe=pipe2)
+        assert res_blind["blind_cameras"] == ["agentview_rgb"] and len(calls2) > 0
+        for c in calls2:
+            assert torch.equal(c["frame"][0, 0], torch.zeros_like(c["frame"][0, 0]))          # third-person view: black
+            assert torch.equal(c["frame"][0, 1], demo2[c["task"]].frame(0, c["t"])[1])      # wrist view: unchanged
+        for k, ms in enumerate(resets2):                                                     # milestones unchanged
+            assert torch.equal(ms, demo2[0].milestone_frames(k % len(demo2[0].episodes)).unsqueeze(0))
+        calls2.clear()
+        evaluate(parse2(["--out", os.path.join(tmp, "eval_blind_all"), "--task-ids", "0", "--blind-cameras", "all"]),
+                 suite=suite, env_factory=factory, pipe=pipe2)
+        assert all(not bool(c["frame"].abs().sum()) for c in calls2)
+        for bad_args in (["--blind-cameras", "eye_in_hand_rgb"],                     # not a camera of this checkpoint
+                         ["--init-from-demo", "--milestone-source", "initial"]):    # no demonstration to start from
+            try:
+                evaluate(parse([*bad_args, "--out", os.path.join(tmp, "eval_bad")]), suite=suite, env_factory=factory,
+                         pipe=pipe)
+                raise AssertionError(f"expected ValueError for {bad_args}")
+            except ValueError:
+                pass
+        envs.clear()
+        calls2.clear()
+        res_init = evaluate(parse2(["--out", os.path.join(tmp, "eval_init_demo"), "--task-ids", "1", "--init-from-demo",
+                                    "--milestone-demo", "1"]), suite=suite, env_factory=factory, pipe=pipe2)
+        import h5py
+
+        with h5py.File(os.path.join(data_dir, f"{names[1]}_demo.hdf5"), "r") as f:
+            start = int(f["data"]["demo_1"]["states"][0][0])                 # fake env: column 0 = start frame
+        assert res_init["init_from_demo"]
+        assert all(ep["init_state_from"].endswith("/demo_1") for ep in res_init["tasks"][0]["episodes"])
+        assert calls2[0]["t"] == min(start + wait, envs[0].length - 1)      # first decision after the settling steps
         pipe2.step, pipe2.reset = step2_fn, reset2_fn
         for ds in demo_ds + demo2:
             ds.close()

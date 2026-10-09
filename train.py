@@ -1124,6 +1124,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     io.add_argument("--milestone-phases", choices=("threshold", "index"), default="threshold",
                     help="how m_t is assigned along demonstrations in stage 2 (Eq. 9a with tau*, or frame index)")
     io.add_argument("--val-fraction", type=float, default=0.05)
+    io.add_argument("--demos-per-task", type=int,
+                    help="sanity test: use only the first N demonstrations of every task (e.g. 1 for the single-demo "
+                         "overfit test; validation is then usually empty and disabled)")
 
     model = p.add_argument_group("model (VPAConfig overrides)")
     model.add_argument("--config-json", help="JSON object of VPAConfig fields")
@@ -1225,6 +1228,14 @@ def run(args: argparse.Namespace) -> VPAInferencePipeline:
     cfg = VPAConfig(**overrides) if ckpt is not None else make_config(overrides, ds)
     ds.image_size = (int(cfg.image_size[0]), int(cfg.image_size[1]))
     check_data_matches(cfg, ds)
+    if args.demos_per_task is not None:
+        if args.demos_per_task < 1:
+            raise ValueError("--demos-per-task must be >= 1")
+        by_task: Dict[int, List[int]] = defaultdict(list)
+        for e in ds.episode_ids.tolist():                       # file order, demo_0 first
+            by_task[ds.episodes[e].task].append(e)
+        ds = ds.subset([e for eps in by_task.values() for e in eps[:args.demos_per_task]])
+        logger.info("--demos-per-task %d: using episodes %s", args.demos_per_task, ds.episode_ids.tolist())
     train_ds, val_ds = ds.split_episodes(args.val_fraction, seed=args.seed)
     logger.info("data: %d files, %d tasks, %d episodes (%d train / %d val), %d frames; %d train samples; "
                 "labels %s (N_u = %d), milestones %s; d_s = %d, d_a = %d, frames %s, cameras %s",
@@ -1259,6 +1270,8 @@ def run(args: argparse.Namespace) -> VPAInferencePipeline:
             "primitive_source": ds.primitive_source, "milestone_source": ds.milestone_source,
             "gripper_window": ds.gripper_window, "chunk_padding": ds.chunk_padding,
             "val_episodes": val_ds.episode_ids.tolist(),
+            "demos_per_task": args.demos_per_task,
+            "episodes_used": ds.episode_ids.tolist(),
         },
         "text_encoder": {"kind": text_kind, "name": cfg.clip_model_name, "embed_dim": text_encoder.embed_dim},
         "encoder_init": encoder_init,
@@ -1597,7 +1610,9 @@ def _self_test() -> None:
         assert ckpt2["config"]["num_views"] == 2 and ckpt2["extra"]["data"]["camera_keys"] == keys2
         assert camera_keys_of(ckpt2["extra"]["data"]) == tuple(keys2)
         assert camera_keys_of({"camera_key": "agentview_rgb"}) == ("agentview_rgb",)      # older checkpoints
-        assert load_checkpoint(os.path.join(e2e.out, "policy_final.pt"))["config"]["num_views"] == 1
+        e2e_ckpt = load_checkpoint(os.path.join(e2e.out, "policy_final.pt"))
+        assert e2e_ckpt["config"]["num_views"] == 1
+        e2e_ckpt_data = e2e_ckpt["extra"]["data"]
         pipe2 = load_pipeline(os.path.join(two.out, "policy_final.pt"))
         assert pipe2.vision_encoder.num_views == 2
         assert pipe2.vision_encoder.head.in_features == 2 * _TINY_CONFIG["vit_width"]
@@ -1621,6 +1636,15 @@ def _self_test() -> None:
                        ["--stage", "policy", "--policy-steps", "1", "--init-from", os.path.join(two.out, "jepa_final.pt")]))
         cont = load_checkpoint(os.path.join(tmp, "two_cams_policy", "policy_final.pt"))
         assert cont["extra"]["data"]["camera_keys"] == keys2 and cont["config"]["num_views"] == 2
+
+        # ---- --demos-per-task (single-demo overfit test): only the first demonstration of each task is used
+        few = os.path.join(tmp, "one_demo")
+        run(_test_args(data_dir, few, cfg_path, ["--jepa-steps", "1", "--policy-steps", "1", "--demos-per-task", "1"]))
+        few_ckpt = load_checkpoint(os.path.join(few, "policy_final.pt"))
+        first_of_task = [0, 4]          # file A: demos 0-3 (task 0), file B: demos 0-2 (task 1)
+        assert few_ckpt["extra"]["data"]["episodes_used"] == first_of_task
+        assert few_ckpt["extra"]["data"]["demos_per_task"] == 1 and few_ckpt["extra"]["data"]["val_episodes"] == []
+        assert e2e_ckpt_data["demos_per_task"] is None and len(e2e_ckpt_data["episodes_used"]) == 7
         _close_logging()
     print("train.py self-test passed")
 
