@@ -46,12 +46,17 @@ Decisions where the paper is silent (do not change silently):
       and gradient clipping is applied per module, so they are optimised independently.
     * E_psi starts from random weights unless ``--init-encoder`` is given; then its first blocks are
       initialised from DINOv2 (``pretrained_encoder.py``) and stage 1 trains it with Eq. 11 as usual.
+    * I_t is one camera (``--camera-keys agentview_rgb``, the default) or the tuple of several views
+      (e.g. ``--camera-keys agentview_rgb eye_in_hand_rgb``). VPAConfig.num_views follows the data;
+      every frame E_psi sees -- I_t, I_{t+nu}, milestones, the latent cache -- carries the same views,
+      and the camera keys (in order) are stored in the checkpoint. Nothing else changes.
 
 Usage:
     python train.py --data /path/to/libero_10 --out runs/libero10
     python train.py --data ... --out ... --stage policy --init-from runs/libero10/jepa_final.pt
     python train.py --data ... --out ... --resume runs/libero10/jepa_step0010000.pt
     python train.py --data ... --out runs/libero10_dino --init-encoder dinov2-small --encoder-lr 1e-4
+    python train.py --data ... --out runs/libero10_2cam --camera-keys agentview_rgb eye_in_hand_rgb
     python train.py --self-test        # offline, CPU, synthetic LIBERO-format data (needs h5py)
 
 The final checkpoint loads straight into the inference pipeline with ``load_pipeline(path)``.
@@ -81,6 +86,7 @@ from torch import Tensor
 
 try:  # package import (e.g. `from vpa.train import ...`)
     from .dataset import (
+        DEFAULT_CAMERA_KEY,
         DEFAULT_PROPRIO_KEYS,
         LiberoFrameDataset,
         LiberoHDF5Dataset,
@@ -95,6 +101,7 @@ try:  # package import (e.g. `from vpa.train import ...`)
     from .selector import NeuroSymbolicSelector
 except ImportError:  # flat import (files side by side, `python train.py`)
     from dataset import (
+        DEFAULT_CAMERA_KEY,
         DEFAULT_PROPRIO_KEYS,
         LiberoFrameDataset,
         LiberoHDF5Dataset,
@@ -110,6 +117,7 @@ except ImportError:  # flat import (files side by side, `python train.py`)
 
 __all__ = [
     "JEPATrainer",
+    "camera_keys_of",
     "PolicyData",
     "PolicyTrainer",
     "build_arg_parser",
@@ -312,12 +320,27 @@ def resolve_overrides(args: argparse.Namespace) -> Dict[str, Any]:
     return overrides
 
 
+def camera_keys_of(data_info: Dict[str, Any]) -> Tuple[str, ...]:
+    """Camera keys (in view order) recorded in a checkpoint's ``extra["data"]``.
+
+    Checkpoints written before multi-camera support store a single ``camera_key``.
+    """
+    keys = data_info.get("camera_keys")
+    if keys is None:
+        keys = [data_info.get("camera_key", DEFAULT_CAMERA_KEY)]
+    return tuple(str(k) for k in keys)
+
+
 def make_config(overrides: Dict[str, Any], ds: LiberoHDF5Dataset) -> VPAConfig:
     """VPAConfig = defaults <- overrides <- quantities fixed by the data (d_s, d_a, C, N_u >= labels)."""
     values = dict(overrides)
     if "image_size" not in values:  # default: the frames' native resolution
         values["image_size"] = (ds.native_image_shape[0], ds.native_image_shape[1])
     values["in_channels"] = ds.native_image_shape[2]
+    if int(values.get("num_views", ds.num_views)) != ds.num_views:
+        raise ValueError(f"num_views = {values['num_views']} but {ds.num_views} camera key(s) were given: "
+                         f"{list(ds.camera_keys)}")
+    values["num_views"] = ds.num_views
     values["proprio_dim"] = ds.proprio_dim
     values["action_dim"] = ds.action_dim
     values["num_primitives"] = int(values.get("num_primitives", ds.num_primitives))
@@ -332,6 +355,7 @@ def check_data_matches(cfg: VPAConfig, ds: LiberoHDF5Dataset) -> None:
         ("proprio_dim (d_s)", ds.proprio_dim, cfg.proprio_dim),
         ("action_dim (d_a)", ds.action_dim, cfg.action_dim),
         ("image channels", ds.image_shape[0], cfg.in_channels),
+        ("camera views V", ds.num_views, cfg.num_views),
         ("image size", ds.image_shape[1:], tuple(cfg.image_size)),
         ("horizon H", ds.horizon, cfg.horizon),
         ("predictor stride nu", ds.predictor_stride, cfg.predictor_stride),
@@ -506,7 +530,8 @@ class JEPATrainer:
         """Eq. 11 on one batch.
 
         Args:
-            batch: ``image [B, C, H_img, W_img]`` (I_t), ``next_image [B, C, H_img, W_img]`` (I_{t+nu}),
+            batch: ``image [B, *frame_shape]`` (I_t), ``next_image [B, *frame_shape]`` (I_{t+nu}), where
+                ``frame_shape`` is ``[C, H_img, W_img]``, or ``[V, C, H_img, W_img]`` with V camera views,
                 ``primitive [B]`` (u_t).
 
         Returns:
@@ -1087,7 +1112,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     io.add_argument("--stage", choices=("all", "jepa", "policy"), default="all")
     io.add_argument("--resume", help="continue from a checkpoint (model, optimiser, schedule, step)")
     io.add_argument("--init-from", help="load model weights only (e.g. jepa_final.pt for --stage policy)")
-    io.add_argument("--camera-key", default="agentview_rgb")
+    io.add_argument("--camera-keys", "--camera-key", dest="camera_keys", nargs="+", metavar="KEY",
+                    help="camera(s) forming I_t, in view order (default: agentview_rgb, or the checkpoint's); "
+                         "e.g. --camera-keys agentview_rgb eye_in_hand_rgb")
     io.add_argument("--proprio-keys", nargs="+", default=list(DEFAULT_PROPRIO_KEYS))
     io.add_argument("--no-rotate", action="store_true", help="do not rotate LIBERO frames by 180 degrees")
     io.add_argument("--primitive-source", choices=("auto", "hdf5", "gripper"), default="auto")
@@ -1185,8 +1212,12 @@ def run(args: argparse.Namespace) -> VPAInferencePipeline:
         overrides.setdefault("image_size", (112, 112))  # 8 x 8 patches, as many tokens as 128 / 16
     horizon = int(overrides.get("horizon", VPAConfig.horizon))
     stride = int(overrides.get("predictor_stride", VPAConfig.predictor_stride))
+    stored_keys = camera_keys_of(ckpt["extra"]["data"]) if ckpt is not None else None
+    camera_keys = tuple(args.camera_keys) if args.camera_keys else (stored_keys or (DEFAULT_CAMERA_KEY,))
+    if stored_keys is not None and camera_keys != stored_keys:
+        raise ValueError(f"--camera-keys {list(camera_keys)} differ from the checkpoint's {list(stored_keys)}")
     ds = LiberoHDF5Dataset(
-        args.data, horizon, predictor_stride=stride, camera_key=args.camera_key, proprio_keys=args.proprio_keys,
+        args.data, horizon, predictor_stride=stride, camera_keys=camera_keys, proprio_keys=args.proprio_keys,
         rotate_180=not args.no_rotate, primitive_source=args.primitive_source,
         milestone_source=args.milestone_source, gripper_window=args.gripper_window,
         chunk_padding=args.chunk_padding,
@@ -1196,10 +1227,10 @@ def run(args: argparse.Namespace) -> VPAInferencePipeline:
     check_data_matches(cfg, ds)
     train_ds, val_ds = ds.split_episodes(args.val_fraction, seed=args.seed)
     logger.info("data: %d files, %d tasks, %d episodes (%d train / %d val), %d frames; %d train samples; "
-                "labels %s (N_u = %d), milestones %s; d_s = %d, d_a = %d, frames %s",
+                "labels %s (N_u = %d), milestones %s; d_s = %d, d_a = %d, frames %s, cameras %s",
                 len(ds.files), len(ds.instructions), len(ds.episodes), train_ds.episode_ids.size,
                 val_ds.episode_ids.size, ds.num_frames, len(train_ds), ds.primitive_source, cfg.num_primitives,
-                ds.milestone_source, ds.proprio_dim, ds.action_dim, ds.image_shape)
+                ds.milestone_source, ds.proprio_dim, ds.action_dim, ds.frame_shape, list(ds.camera_keys))
     if ckpt is not None:
         stored = ckpt["extra"]["data"]["val_episodes"]
         if stored != val_ds.episode_ids.tolist():
@@ -1223,7 +1254,7 @@ def run(args: argparse.Namespace) -> VPAInferencePipeline:
     pipe.to(device)
     extra = {
         "data": {
-            "files": ds.files, "instructions": ds.instructions, "camera_key": ds.camera_key,
+            "files": ds.files, "instructions": ds.instructions, "camera_keys": list(ds.camera_keys),
             "proprio_keys": list(ds.proprio_keys), "rotate_180": ds.rotate_180,
             "primitive_source": ds.primitive_source, "milestone_source": ds.milestone_source,
             "gripper_window": ds.gripper_window, "chunk_padding": ds.chunk_padding,
@@ -1556,6 +1587,40 @@ def _self_test() -> None:
         init_vision_encoder(fresh, dino_dir)
         reference = Dinov2Model.from_pretrained(dino_dir).embeddings.cls_token.detach()
         assert torch.equal(fresh.cls_token.detach(), reference) and not torch.equal(before, reference)
+        # ---- two cameras end to end: I_t, I_{t+nu}, the milestones and the latent cache all carry both
+        # views; the checkpoint records the camera keys; the pipeline runs on [B, 2, C, H, W] (K + 3)
+        keys2 = ["agentview_rgb", "eye_in_hand_rgb"]
+        two = _test_args(data_dir, os.path.join(tmp, "two_cams"), cfg_path,
+                         ["--jepa-steps", "2", "--policy-steps", "2", "--camera-keys", *keys2])
+        run(two)
+        ckpt2 = load_checkpoint(os.path.join(two.out, "policy_final.pt"))
+        assert ckpt2["config"]["num_views"] == 2 and ckpt2["extra"]["data"]["camera_keys"] == keys2
+        assert camera_keys_of(ckpt2["extra"]["data"]) == tuple(keys2)
+        assert camera_keys_of({"camera_key": "agentview_rgb"}) == ("agentview_rgb",)      # older checkpoints
+        assert load_checkpoint(os.path.join(e2e.out, "policy_final.pt"))["config"]["num_views"] == 1
+        pipe2 = load_pipeline(os.path.join(two.out, "policy_final.pt"))
+        assert pipe2.vision_encoder.num_views == 2
+        assert pipe2.vision_encoder.head.in_features == 2 * _TINY_CONFIG["vit_width"]
+        check2 = LiberoHDF5Dataset(data_dir, 4, camera_keys=keys2, milestone_source="gripper", gripper_window=2,
+                                   image_size=(16, 16))
+        pipe2.reset(check2.instructions[0], check2.milestone_frames(0)[None])         # [1, M, 2, C, H, W]
+        out2 = pipe2.step(check2.frame(0, 0)[None], torch.from_numpy(check2.proprioception(0)[:1].copy()))
+        assert out2.num_sequential_evaluations == cfg.integration_steps + 3
+        assert out2.action_chunk.shape == (1, cfg.horizon, cfg.action_dim)
+        check2.close()
+        # continuing a two-camera checkpoint with other cameras is refused ...
+        try:
+            run(_test_args(data_dir, os.path.join(tmp, "two_cams_bad"), cfg_path,
+                           ["--stage", "policy", "--policy-steps", "1", "--camera-keys", "agentview_rgb",
+                            "--init-from", os.path.join(two.out, "jepa_final.pt")]))
+            raise AssertionError("expected ValueError for camera keys that differ from the checkpoint")
+        except ValueError:
+            pass
+        # ... and without --camera-keys the checkpoint's cameras are used
+        run(_test_args(data_dir, os.path.join(tmp, "two_cams_policy"), cfg_path,
+                       ["--stage", "policy", "--policy-steps", "1", "--init-from", os.path.join(two.out, "jepa_final.pt")]))
+        cont = load_checkpoint(os.path.join(tmp, "two_cams_policy", "policy_final.pt"))
+        assert cont["extra"]["data"]["camera_keys"] == keys2 and cont["config"]["num_views"] == 2
         _close_logging()
     print("train.py self-test passed")
 

@@ -26,6 +26,12 @@ Frames go through exactly the transform of ``LiberoHDF5Dataset`` (180-degree rot
 checkpoint was trained with it, scaling to [0, 1], resize to the model's input size). The camera
 renders at ``--camera-size`` (128, the resolution of the LIBERO datasets) before that resize.
 
+Cameras. I_t is built from the cameras the checkpoint was trained with (``camera_keys`` in its data
+record; older checkpoints store a single ``camera_key``). One camera gives ``[1, C, H_img, W_img]``;
+several give the views stacked in the training order, ``[1, V, C, H_img, W_img]``, exactly as
+``LiberoHDF5Dataset.frame``. Milestone frames carry the same views. There is no camera flag: the
+trained model decides. Videos show the views side by side.
+
 Milestone frames. LIBERO provides no goal images, but the paper's goal g = (x, I_g^(1..M)) needs
 them (Sec. 3.1). ``--milestone-source demo`` (default) takes them from a demonstration of the same
 task with the rule the checkpoint was trained with (final frame, gripper releases or annotated
@@ -41,15 +47,28 @@ Decisions where the paper is silent (do not change silently):
     * The flow noise xi of every decision step comes from a CPU generator seeded per episode
       (seed + 1000 * task_id + trial), so results do not depend on the device or task subset.
 
-Requirements: LIBERO (and its robosuite / MuJoCo stack). Headless Linux usually needs
-``MUJOCO_GL=egl``. LIBERO asks for its dataset folder on the first import; run
+Requirements: LIBERO installed without its pinned requirements (``pip install -e LIBERO --no-deps``)
+plus the packages its simulator imports (``LIBERO_DEPENDENCIES``):
+
+    pip install pyyaml "robosuite==1.4.0" "mujoco==2.3.7" "bddl==1.0.1" easydict matplotlib "gym==0.25.2" cloudpickle
+
+``eval.py`` checks them before importing LIBERO and names the missing ones. Headless Linux usually
+needs ``MUJOCO_GL=egl``. LIBERO asks for its dataset folder on the first import; run
 ``python -c "import libero.libero"`` once interactively to create ``~/.libero/config.yaml``.
 ``--save-video`` needs ``imageio`` with ``imageio-ffmpeg``.
 
+Eq. 15 options: --fixed-horizon (ablation: execute a fixed number of actions instead of H_t), --beta and
+--min-horizon (override the checkpoint's values), per-step sigma / H_t in the results, and --suggest-beta.
+(``eval_fixed_horizon.py``, where these options were first added, now forwards to this file.)
+
 Usage:
     python eval.py --checkpoint runs/libero10/policy_final.pt --suite-name libero_10
+    python eval.py --checkpoint ... --suite-name libero_10 --num-trials-per-task 50 --out eval_results/l10
     python eval.py --checkpoint ... --suite-name libero_90 --task-ids 0 1 2 --out eval_results/shard0
-    python eval.py --self-test        # offline, CPU: fake suite and environment, tiny trained model
+    python eval.py --checkpoint ... --suite-name libero_10 --fixed-horizon 4 --out eval_results/fixed_H4
+    python eval.py --suggest-beta eval_results/sigma/eval_metrics.json
+    python eval.py --checkpoint ... --suite-name libero_10 --beta 37.6 --out eval_results/beta37
+    python eval.py --self-test   # offline, CPU: fake suite and environment, tiny trained model
 """
 
 from __future__ import annotations
@@ -57,6 +76,8 @@ from __future__ import annotations
 import argparse
 import contextlib
 import dataclasses
+import importlib.metadata
+import importlib.util
 import json
 import logging
 import math
@@ -76,11 +97,11 @@ from torch import Tensor
 try:  # package import (e.g. `from vpa.eval import ...`)
     from .dataset import LiberoHDF5Dataset, _write_synthetic_libero
     from .pipeline import VPAConfig, VPAInferencePipeline
-    from .train import _json_safe, load_checkpoint, load_pipeline, resolve_device, seed_everything
+    from .train import _json_safe, camera_keys_of, load_checkpoint, load_pipeline, resolve_device, seed_everything
 except ImportError:  # flat import (files side by side, `python eval.py`)
     from dataset import LiberoHDF5Dataset, _write_synthetic_libero
     from pipeline import VPAConfig, VPAInferencePipeline
-    from train import _json_safe, load_checkpoint, load_pipeline, resolve_device, seed_everything
+    from train import _json_safe, camera_keys_of, load_checkpoint, load_pipeline, resolve_device, seed_everything
 
 __all__ = [
     "SUITES",
@@ -168,7 +189,8 @@ class FramePreprocessor:
         image_size: model input size (H_img, W_img).
 
     Shapes:
-        ``[H, W, C]`` uint8 -> ``[C, H_img, W_img]`` float32
+        ``__call__``: ``[H, W, C]`` uint8 -> ``[C, H_img, W_img]`` float32
+        ``views``:    raw observation -> ``[C, H_img, W_img]`` (one camera) or ``[V, C, H_img, W_img]``
     """
 
     _to_tensor = LiberoHDF5Dataset._to_tensor
@@ -181,6 +203,21 @@ class FramePreprocessor:
         if np.asarray(raw).ndim != 3:
             raise ValueError(f"expected one frame [H, W, C], got shape {np.asarray(raw).shape}")
         return self._to_tensor(raw)
+
+    def views(self, obs: Dict[str, np.ndarray], obs_keys: Sequence[str]) -> Tensor:
+        """I_t from a raw observation, laid out as ``LiberoHDF5Dataset.frame``.
+
+        Args:
+            obs: raw observation dict of the LIBERO environment.
+            obs_keys: raw camera keys in training view order (``CAMERA_OBS_KEYS`` values).
+
+        Returns:
+            ``[C, H_img, W_img]`` for one camera; ``[V, C, H_img, W_img]`` (views stacked in
+            ``obs_keys`` order) for V >= 2.
+        """
+        if len(obs_keys) == 1:
+            return self(obs[obs_keys[0]])
+        return torch.stack([self(obs[key]) for key in obs_keys], dim=0)
 
 
 def _normalise(text: str) -> str:
@@ -250,7 +287,7 @@ class DemoMilestones:
                 self.cfg.horizon,
                 predictor_stride=self.cfg.predictor_stride,
                 image_size=(int(self.cfg.image_size[0]), int(self.cfg.image_size[1])),
-                camera_key=self.data_info["camera_key"],
+                camera_keys=camera_keys_of(self.data_info),
                 proprio_keys=self.data_info["proprio_keys"],
                 rotate_180=self.rotate_180,
                 primitive_source="gripper",              # labels are not used here
@@ -260,7 +297,7 @@ class DemoMilestones:
         return self._cache[task_id]
 
     def frames(self, suite: Any, task_id: int, task: Any, trial: int) -> Tuple[Tensor, Dict[str, Any]]:
-        """Milestone frames ``[1, M, C, H_img, W_img]`` for one trial, and a record of their source."""
+        """Milestone frames ``[1, M, *frame_shape]`` (the checkpoint's views) for one trial, and their source."""
         ds = self._dataset(suite, task_id, task)
         episode = (self.fixed_demo if self.fixed_demo is not None else trial) % len(ds.episodes)
         ep = ds.episodes[episode]
@@ -281,8 +318,73 @@ class DemoMilestones:
 # ---------------------------------------------------------------------------------------------
 # LIBERO access (imported lazily so the rest of this file works without LIBERO)
 # ---------------------------------------------------------------------------------------------
+# Third-party modules imported by libero.libero, libero.libero.benchmark and libero.libero.envs
+# (besides torch and numpy) -> pip requirement. Pins follow LIBERO's requirements.txt where an
+# unpinned install could pick an incompatible major version; LIBERO's other pins (torch,
+# transformers, numpy, ...) are deliberately not repeated, since they would downgrade this project.
+LIBERO_DEPENDENCIES: Dict[str, str] = {
+    "yaml": "pyyaml",
+    "robosuite": "robosuite==1.4.0",
+    "mujoco": "mujoco==2.3.7",   # robosuite 1.4 breaks on MuJoCo 3 (get_joint_qpos_addr assertion)
+    "bddl": "bddl==1.0.1",
+    "easydict": "easydict",
+    "matplotlib": "matplotlib",
+    "gym": "gym==0.25.2",
+    "cloudpickle": "cloudpickle",
+}
+
+
+def missing_libero_dependencies() -> List[str]:
+    """pip requirements of LIBERO's simulator imports that are not installed in this environment."""
+    missing = []
+    for module, requirement in LIBERO_DEPENDENCIES.items():
+        try:
+            found = importlib.util.find_spec(module) is not None
+        except (ImportError, ValueError):
+            found = False
+        if not found:
+            missing.append(requirement)
+    return missing
+
+
+def incompatible_libero_versions() -> List[str]:
+    """Known-bad version combinations of LIBERO's simulator stack (empty if none or not installed)."""
+    try:
+        robosuite_version = importlib.metadata.version("robosuite")
+        mujoco_version = importlib.metadata.version("mujoco")
+    except importlib.metadata.PackageNotFoundError:
+        return []
+    problems = []
+    if robosuite_version.startswith("1.4") and int(mujoco_version.split(".")[0]) >= 3:
+        problems.append(f"robosuite {robosuite_version} (used by LIBERO) does not work with mujoco {mujoco_version}; "
+                        'run: pip install "mujoco==2.3.7"')
+    return problems
+
+
 def import_libero() -> SimpleNamespace:
-    """``benchmark``, ``get_libero_path`` and ``OffScreenRenderEnv`` from LIBERO, with clear errors."""
+    """``benchmark``, ``get_libero_path`` and ``OffScreenRenderEnv`` from LIBERO, with clear errors.
+
+    Raises:
+        ImportError: naming LIBERO itself or every missing dependency, with the pip command to fix it.
+        RuntimeError: if LIBERO's first-import configuration prompt cannot be answered.
+    """
+    try:
+        found = importlib.util.find_spec("libero") is not None
+    except (ImportError, ValueError):
+        found = False
+    if not found:
+        raise ImportError("LIBERO is not installed: git clone https://github.com/Lifelong-Robot-Learning/LIBERO "
+                          "&& pip install -e LIBERO --no-deps, then install its dependencies (see eval.py)")
+    missing = missing_libero_dependencies()
+    incompatible = incompatible_libero_versions()
+    if incompatible:
+        raise ImportError("incompatible simulator packages: " + "; ".join(incompatible))
+    if missing:
+        raise ImportError(
+            "LIBERO is installed, but these packages it imports are missing: " + ", ".join(missing)
+            + "\n  pip install " + " ".join(f'"{m}"' for m in missing)
+            + "\n(Do not use LIBERO's requirements.txt here: it pins old torch, transformers and numpy versions.)"
+        )
     try:
         from libero.libero import benchmark, get_libero_path
         from libero.libero.envs import OffScreenRenderEnv
@@ -291,10 +393,9 @@ def import_libero() -> SimpleNamespace:
             "LIBERO asked for its dataset folder on first import. Run `python -c \"import libero.libero\"` "
             "once interactively (or set LIBERO_CONFIG_PATH to a folder with config.yaml), then retry."
         ) from exc
-    except ImportError as exc:
-        raise ImportError(
-            "LIBERO is not installed; see https://github.com/Lifelong-Robot-Learning/LIBERO"
-        ) from exc
+    except ImportError as exc:  # a dependency outside LIBERO_DEPENDENCIES, or a broken install
+        name = exc.name or str(exc)
+        raise ImportError(f"importing LIBERO failed because '{name}' could not be imported: {exc}") from exc
     return SimpleNamespace(benchmark=benchmark, get_libero_path=get_libero_path,
                            OffScreenRenderEnv=OffScreenRenderEnv)
 
@@ -306,8 +407,37 @@ def make_suite(libero: SimpleNamespace, name: str, task_order_index: int = 0) ->
     return libero.benchmark.get_benchmark(name)(task_order_index)
 
 
+RENDER_CHECK = (
+    'MUJOCO_GL=egl PYOPENGL_PLATFORM=egl python -c "from robosuite.renderers.context.egl_context '
+    "import EGLGLContext; EGLGLContext(128, 128, -1).make_current(); print('EGL OK')\""
+)
+
+
+def render_setup_hint(exc: BaseException) -> str:
+    """Likely fixes for an off-screen rendering failure, keyed on the exception text."""
+    text = f"{type(exc).__name__}: {exc}"
+    if "egl" not in text.lower():
+        return ""
+    return (
+        "\nMuJoCo/robosuite could not create an EGL (headless GPU) OpenGL context. Check, in order:\n"
+        "  1. nvidia-smi works, and the driver ships its EGL library: "
+        "`ls /usr/share/glvnd/egl_vendor.d/` lists 10_nvidia.json and `ldconfig -p | grep libEGL_nvidia` "
+        "finds it (on Ubuntu: sudo apt-get install libnvidia-gl-<driver major version>);\n"
+        "  2. the GL loader libraries exist: sudo apt-get install libegl1 libgl1 libglvnd0;\n"
+        "  3. MUJOCO_EGL_DEVICE_ID / CUDA_VISIBLE_DEVICES, if set, name a GPU that exists.\n"
+        f"Test rendering alone with:\n  {RENDER_CHECK}\n"
+        "Without a working GPU EGL stack, CPU rendering works (slower): sudo apt-get install libosmesa6-dev and run "
+        "with MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa."
+    )
+
+
 def make_env(libero: SimpleNamespace, task: Any, camera_size: int, horizon: int, retries: int = 3) -> Any:
-    """LIBERO ``OffScreenRenderEnv`` for one task (retried, since off-screen contexts can fail transiently)."""
+    """LIBERO ``OffScreenRenderEnv`` for one task (retried, since off-screen contexts can fail transiently).
+
+    Raises:
+        RuntimeError: whose message carries the underlying error and, for rendering failures, the
+            likely fixes (the original exception is chained as its cause).
+    """
     bddl = os.path.join(libero.get_libero_path("bddl_files"), task.problem_folder, task.bddl_file)
     env_args = {"bddl_file_name": bddl, "camera_heights": camera_size, "camera_widths": camera_size,
                 "horizon": horizon}
@@ -317,10 +447,14 @@ def make_env(libero: SimpleNamespace, task: Any, camera_size: int, horizon: int,
             return libero.OffScreenRenderEnv(**env_args)
         except Exception as exc:  # renderer / context creation errors
             last = exc
-            LOGGER.warning("creating the environment for %s failed (attempt %d/%d): %s",
-                           task.name, attempt + 1, retries, exc)
+            LOGGER.warning("creating the environment for %s failed (attempt %d/%d): %s: %s",
+                           task.name, attempt + 1, retries, type(exc).__name__, exc)
+            if "egl" in str(exc).lower():   # a missing EGL stack does not fix itself; do not retry
+                break
             time.sleep(2.0)
-    raise RuntimeError(f"could not create the LIBERO environment for {task.name}") from last
+    assert last is not None
+    raise RuntimeError(f"could not create the LIBERO environment for {task.name}: "
+                       f"{type(last).__name__}: {last}{render_setup_hint(last)}") from last
 
 
 def load_init_states(suite: Any, task_id: int, get_libero_path: Optional[Callable[[str], str]] = None) -> Any:
@@ -370,7 +504,7 @@ class EpisodeContext:
     """Fixed inputs of every episode of a run."""
 
     preprocess: FramePreprocessor
-    camera_obs_key: str
+    camera_obs_keys: Tuple[str, ...]      # raw camera keys, in the checkpoint's view order
     proprio_keys: Sequence[str]
     max_steps: int
     num_steps_wait: int
@@ -378,6 +512,7 @@ class EpisodeContext:
     device: torch.device
     record_video: bool = False
     rotate_view: bool = True
+    fixed_horizon: Optional[int] = None   # ablation: execute this many actions instead of H_t (Eq. 15)
 
 
 @torch.no_grad()
@@ -399,7 +534,8 @@ def run_episode(
         ctx: run-wide settings.
         instruction: language instruction x.
         init_state: LIBERO initial simulator state.
-        milestones: ``[1, M, C, H_img, W_img]`` goal frames, or None for the initial observation (M = 1).
+        milestones: ``[1, M, *frame_shape]`` goal frames (``frame_shape`` = ``[C, H_img, W_img]`` or
+            ``[V, C, H_img, W_img]``), or None for the initial observation (M = 1).
         generator: CPU generator for the flow noise xi of every decision step.
 
     Returns:
@@ -417,11 +553,12 @@ def run_episode(
     video: List[np.ndarray] = []
 
     def view(o: Dict[str, np.ndarray]) -> np.ndarray:
-        img = np.asarray(o[ctx.camera_obs_key])
-        return np.ascontiguousarray(img[::-1, ::-1] if ctx.rotate_view else img)
+        imgs = [np.asarray(o[key]) for key in ctx.camera_obs_keys]
+        imgs = [img[::-1, ::-1] if ctx.rotate_view else img for img in imgs]
+        return np.ascontiguousarray(np.concatenate(imgs, axis=1))                  # views side by side
 
     if milestones is None:                                                          # fallback, M = 1
-        milestones = ctx.preprocess(obs[ctx.camera_obs_key]).unsqueeze(0).unsqueeze(0)
+        milestones = ctx.preprocess.views(obs, ctx.camera_obs_keys).unsqueeze(0).unsqueeze(0)
     pipe.reset(instruction, milestones.to(ctx.device))                              # c_text, z_g^(1..M)
     if ctx.record_video:
         video.append(view(obs))
@@ -433,7 +570,7 @@ def run_episode(
     latencies: List[float] = []
     primitives: Counter = Counter()
     while env_steps < ctx.max_steps and not success:
-        frame = ctx.preprocess(obs[ctx.camera_obs_key]).unsqueeze(0).to(ctx.device)          # [1, C, H, W]
+        frame = ctx.preprocess.views(obs, ctx.camera_obs_keys).unsqueeze(0).to(ctx.device)   # [1, *frame_shape]
         state = torch.from_numpy(proprio_from_obs(obs, ctx.proprio_keys)).unsqueeze(0).to(ctx.device)  # [1, d_s]
         noise = torch.randn((1, horizon, action_dim), generator=generator).to(ctx.device)     # xi
         _synchronize(ctx.device)
@@ -448,13 +585,14 @@ def run_episode(
         h_t = int(out.executed_horizon[0])                                                     # Eq. 15
         horizons.append(h_t)
         sigmas.append(float(out.sigma[0]))
+        executed = h_t if ctx.fixed_horizon is None else min(ctx.fixed_horizon, horizon)
         primitives[int(out.primitive[0])] += 1
         if complete_step is None and bool(out.task_complete[0]):                              # Eq. 9a at m_t = M
             complete_step = env_steps
             if ctx.stop_on_task_complete:
                 stopped_by_pointer = True
                 break
-        prefix = out.action_chunk[0, :h_t].float().cpu().numpy().astype(np.float64)          # [H_t, d_a]
+        prefix = out.action_chunk[0, :executed].float().cpu().numpy().astype(np.float64)     # [H_t, d_a]
         for action in prefix:
             obs, _, done, _ = _env_call(env.step, np.clip(action, -1.0, 1.0))
             env_steps += 1
@@ -481,6 +619,9 @@ def run_episode(
         "executed_horizon_mean": float(np.mean(horizons)) if horizons else None,
         "executed_horizon_min": int(min(horizons)) if horizons else None,
         "sigma_mean": float(np.mean(sigmas)) if sigmas else None,
+        "sigma_steps": [round(v, 6) for v in sigmas],                       # sigma_{t+1} per decision step
+        "horizon_steps": horizons,                                          # H_t from Eq. 15 per decision step
+        "executed_steps_per_decision": ctx.fixed_horizon,                   # None: H_t was executed
         "primitive_counts": {str(k): v for k, v in sorted(primitives.items())},
         "step_latency_ms_mean": float(lat.mean()),
         "step_latency_ms_p95": float(np.percentile(lat, 95)),
@@ -574,17 +715,33 @@ def evaluate(
     if not (pipe.solver.is_calibrated and bool(pipe.tracker.frozen)):
         raise RuntimeError("the pipeline is not calibrated (gamma*, mu_Z, mu_S, sigma_S missing)")
     pipe.eval()
+    # Eq. 15 deployment settings (beta, H_min are hyper-parameters; the paper does not fix them)
+    hf = pipe.horizon_filter
+    if args.beta is not None:
+        if not args.beta > 0.0:
+            raise ValueError("--beta must be positive")
+        hf.beta = float(args.beta)
+    if args.min_horizon is not None:
+        if not pipe.predictor_stride <= args.min_horizon <= hf.h_max:
+            raise ValueError(f"--min-horizon must lie in [nu = {pipe.predictor_stride}, H_max = {hf.h_max}]")
+        hf.h_min = int(args.min_horizon)
+    if args.fixed_horizon is not None and not 1 <= args.fixed_horizon <= hf.h_max:
+        raise ValueError(f"--fixed-horizon must lie in [1, {hf.h_max}]")
     rotate = bool(data_info["rotate_180"]) if args.rotate == "checkpoint" else args.rotate == "on"
-    camera_key = data_info["camera_key"]
-    if camera_key not in CAMERA_OBS_KEYS:
-        raise KeyError(f"no LIBERO observation for camera key {camera_key!r}; supported: {sorted(CAMERA_OBS_KEYS)}")
+    camera_keys = camera_keys_of(data_info)
+    unknown_cameras = [k for k in camera_keys if k not in CAMERA_OBS_KEYS]
+    if unknown_cameras:
+        raise KeyError(f"no LIBERO observation for camera keys {unknown_cameras}; supported: {sorted(CAMERA_OBS_KEYS)}")
+    if len(camera_keys) != cfg.num_views:
+        raise ValueError(f"the checkpoint records cameras {list(camera_keys)} but its model has "
+                         f"num_views = {cfg.num_views}")
     proprio_keys = list(data_info["proprio_keys"])
     unknown = [k for k in proprio_keys if k not in PROPRIO_FROM_OBS]
     if unknown:
         raise KeyError(f"no LIBERO observation mapping for proprioception keys {unknown}")
     ctx = EpisodeContext(
         preprocess=FramePreprocessor(rotate, tuple(cfg.image_size)),
-        camera_obs_key=CAMERA_OBS_KEYS[camera_key],
+        camera_obs_keys=tuple(CAMERA_OBS_KEYS[k] for k in camera_keys),
         proprio_keys=proprio_keys,
         max_steps=args.max_steps,
         num_steps_wait=args.num_steps_wait,
@@ -592,6 +749,7 @@ def evaluate(
         device=device,
         record_video=args.save_video,
         rotate_view=rotate,
+        fixed_horizon=args.fixed_horizon,
     )
 
     # ---- benchmark
@@ -643,8 +801,13 @@ def evaluate(
         "milestone_source": args.milestone_source,
         "milestone_rule": data_info["milestone_source"],
         "stop_on_task_complete": args.stop_on_task_complete,
+        "beta": hf.beta,
+        "min_horizon": hf.h_min,
+        "max_horizon": hf.h_max,
+        "fixed_horizon": args.fixed_horizon,
         "rotate_180": rotate,
-        "camera_key": camera_key,
+        "camera_keys": list(camera_keys),
+        "num_views": len(camera_keys),
         "camera_size": args.camera_size,
         "proprio_keys": proprio_keys,
         "config": _json_safe(dataclasses.asdict(cfg)),
@@ -750,6 +913,48 @@ def evaluate(
 
 
 # ---------------------------------------------------------------------------------------------
+# beta calibration (Eq. 15)
+# ---------------------------------------------------------------------------------------------
+def beta_for(sigma: float, h_max: int, h_target: int) -> float:
+    """beta such that sigma_bar = sigma gives H_max * exp(-beta * sigma) = h_target (Eq. 15)."""
+    if not 0 < h_target <= h_max or sigma <= 0.0:
+        raise ValueError("need 0 < h_target <= H_max and sigma > 0")
+    return math.log(h_max / h_target) / sigma
+
+
+def suggest_beta(path: str) -> Dict[str, Any]:
+    """Print the per-step sigma distribution of a finished run and the beta that maps it onto H_t.
+
+    beta is chosen so that the q-th percentile of sigma gives H_t = H_min: steps above that
+    percentile execute H_min actions, the median step a proportionally longer prefix.
+    """
+    with open(path, encoding="utf-8") as f:
+        res = json.load(f)
+    sig = [s for t in res["tasks"] for e in t["episodes"] for s in e.get("sigma_steps", [])]
+    source = "per-step sigma"
+    if not sig:  # runs made before per-step logging: per-episode means only
+        sig = [e["sigma_mean"] for t in res["tasks"] for e in t["episodes"] if e.get("sigma_mean") is not None]
+        source = "per-episode mean sigma (re-run for per-step values)"
+    if not sig:
+        raise ValueError(f"{path} contains no sigma values")
+    h_max = int(res.get("max_horizon") or res["config"]["horizon"])
+    h_min = int(res.get("min_horizon") or res["config"]["min_horizon"])
+    arr = np.asarray(sig, dtype=np.float64)
+    pct = {q: float(np.percentile(arr, q)) for q in (10, 50, 75, 90, 95)}
+    print(f"{len(arr)} values ({source}); H_max = {h_max}, H_min = {h_min}, beta used = {res.get('beta')}")
+    print("sigma percentiles: " + ", ".join(f"p{q} {v:.4g}" for q, v in pct.items()))
+    out: Dict[str, Any] = {"percentiles": pct, "beta": {}}
+    for q in (75, 90, 95):
+        if pct[q] <= 0.0:
+            continue
+        beta = beta_for(pct[q], h_max, h_min)
+        h_median = max(h_min, math.floor(h_max * math.exp(-beta * pct[50])))
+        out["beta"][q] = beta
+        print(f"  beta {beta:8.3f}: H_t = {h_min} above p{q} of sigma, H_t = {h_median} at the median")
+    return out
+
+
+# ---------------------------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------------------------
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -773,6 +978,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--milestone-demo", type=int, help="use this demonstration index for every trial")
     p.add_argument("--stop-on-task-complete", action="store_true",
                    help="end the episode when the Eq. 9a test holds at m_t = M (the paper's termination rule)")
+    p.add_argument("--beta", type=float, help="override beta of Eq. 15 (H_t sensitivity to sigma)")
+    p.add_argument("--min-horizon", type=int, help="override H_min of Eq. 15 (nu <= H_min <= H_max)")
+    p.add_argument("--fixed-horizon", type=int,
+                   help="ablation: execute this many actions per decision instead of H_t (Eq. 15 bypassed)")
+    p.add_argument("--suggest-beta", metavar="EVAL_METRICS_JSON",
+                   help="print beta values from the per-step sigma of a finished run, then exit")
     p.add_argument("--rotate", choices=("checkpoint", "on", "off"), default="checkpoint",
                    help="180-degree frame rotation (default: as in training)")
     p.add_argument("--self-test", action="store_true", help="run the offline self-test and exit")
@@ -783,6 +994,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     args = build_arg_parser().parse_args(argv)
     if args.self_test:
         _self_test()
+        return
+    if args.suggest_beta:
+        suggest_beta(args.suggest_beta)
         return
     evaluate(args)
 
@@ -946,7 +1160,7 @@ def _self_test() -> None:
                  str(max_steps), "--num-steps-wait", str(wait), *extra])
 
         # ---- observation mapping == training data (frames bit-exact, proprioception via the quaternion)
-        assert data_info["camera_key"] == "agentview_rgb" and bool(data_info["rotate_180"])
+        assert camera_keys_of(data_info) == ("agentview_rgb",) and bool(data_info["rotate_180"])
         pre = FramePreprocessor(True, tuple(cfg.image_size))
         probe = factory(tasks[0])
         for t in (0, 5, probe.length - 1):
@@ -1048,6 +1262,32 @@ def _self_test() -> None:
         assert res_d["status"] == "complete" and len(eps) == 2 and len(envs) == 3
         assert all(not e["success"] and "simulated physics failure" in e["error"] for e in eps)
 
+        # ---- Eq. 15 overrides and the fixed-horizon ablation
+        envs.clear()
+        calls.clear()
+        res_e = evaluate(parse(["--out", os.path.join(tmp, "eval_e"), "--task-ids", "1", "--fixed-horizon", "3",
+                                "--beta", "40", "--min-horizon", "2"]), suite=suite, env_factory=factory, pipe=pipe)
+        assert res_e["beta"] == 40.0 and res_e["min_horizon"] == 2 and res_e["fixed_horizon"] == 3
+        for env in envs:
+            for episode, actions in enumerate(env.history):
+                ep_calls = [c for c in calls if c["env"] is env and c["episode"] == episode]
+                assert [c["steps_before"] for c in ep_calls] == [wait + 3 * k for k in range(len(ep_calls))]
+                assert len(actions) == wait + max_steps
+        for ep in res_e["tasks"][0]["episodes"]:
+            assert len(ep["sigma_steps"]) == len(ep["horizon_steps"]) == ep["decision_steps"]
+            for s_val, h_val in zip(ep["sigma_steps"], ep["horizon_steps"], strict=True):
+                # Eq. 15 with the overridden beta / H_min (first-step sigma_bar = sigma, then max filter >= 2)
+                assert 2 <= h_val <= cfg.horizon
+                assert h_val <= max(2, math.floor(cfg.horizon * math.exp(-40.0 * s_val)) + 1)
+        pipe.horizon_filter.beta, pipe.horizon_filter.h_min = cfg.beta, cfg.min_horizon
+        metrics_path = os.path.join(tmp, "eval_a", "eval_metrics.json")
+        with open(metrics_path, encoding="utf-8") as f:
+            sig_a = [s for t in json.load(f)["tasks"] for e in t["episodes"] for s in e["sigma_steps"]]
+        suggestion = suggest_beta(metrics_path)
+        for q, beta in suggestion["beta"].items():
+            assert abs(cfg.horizon * math.exp(-beta * float(np.percentile(sig_a, q))) - cfg.min_horizon) < 1e-6
+        assert abs(beta_for(0.05, 16, 4) - math.log(4) / 0.05) < 1e-12
+
         # ---- errors: a stage-1 checkpoint and unknown task ids are rejected
         pipe.step, pipe.reset = step_fn, reset_fn
         for bad_args in (["--checkpoint", os.path.join(train_out, "jepa_final.pt")], ["--task-ids", "7"]):
@@ -1057,7 +1297,66 @@ def _self_test() -> None:
                 raise AssertionError(f"expected ValueError for {bad_args}")
             except ValueError:
                 pass
-        for ds in demo_ds:
+
+        # ---- two cameras: a two-camera checkpoint receives [1, 2, C, H, W] frames and two-view milestones,
+        # each view the training transform of the matching raw camera; the depth stays K + 3
+        keys2 = ["agentview_rgb", "eye_in_hand_rgb"]
+        train_out2 = os.path.join(tmp, "run2")
+        train_run(_test_args(data_dir, train_out2, cfg_path, ["--jepa-steps", "2", "--policy-steps", "2",
+                                                              "--camera-keys", *keys2]))
+        _close_train_logging()
+        ckpt2 = os.path.join(train_out2, "policy_final.pt")
+        demo2 = [LiberoHDF5Dataset(os.path.join(data_dir, f"{n}_demo.hdf5"), cfg.horizon, camera_keys=keys2,
+                                   image_size=tuple(cfg.image_size), milestone_source="gripper",
+                                   primitive_source="gripper", gripper_window=2) for n in names]
+        obs_keys2 = tuple(CAMERA_OBS_KEYS[k] for k in keys2)
+        probe = factory(tasks[0])
+        for t in (0, 4, probe.length - 1):
+            probe.t = t
+            assert torch.equal(pre.views(probe.obs(), obs_keys2), demo2[0].frame(0, t))          # [2, C, H, W]
+            assert torch.equal(pre.views(probe.obs(), obs_keys2[:1]), demo_ds[0].frame(0, t))    # one camera
+        envs.clear()
+        pipe2 = load_pipeline(ckpt2)
+        assert pipe2.vision_encoder.num_views == 2
+        calls2: List[Dict[str, Any]] = []
+        resets2: List[Tensor] = []
+        step2_fn, reset2_fn = pipe2.step, pipe2.reset
+
+        def recording_step2(frame: Tensor, state: Tensor, noise: Optional[Tensor] = None) -> Any:
+            out = step2_fn(frame, state, noise=noise)
+            calls2.append({"frame": frame.clone(), "t": envs[-1].t, "task": envs[-1].task_index, "out": out})
+            return out
+
+        def recording_reset2(instruction: str, milestones: Tensor) -> None:
+            resets2.append(milestones.clone())
+            reset2_fn(instruction, milestones)
+
+        def parse2(extra: Sequence[str]) -> argparse.Namespace:
+            return build_arg_parser().parse_args(
+                ["--checkpoint", ckpt2, "--device", "cpu", "--num-trials-per-task", "2", "--max-steps",
+                 str(max_steps), "--num-steps-wait", str(wait), *extra])
+
+        pipe2.step, pipe2.reset = recording_step2, recording_reset2
+        res2 = evaluate(parse2(["--out", os.path.join(tmp, "eval_two")]), suite=suite, env_factory=factory, pipe=pipe2)
+        assert res2["status"] == "complete" and res2["camera_keys"] == keys2 and res2["num_views"] == 2
+        assert res2["tasks"][0]["success_rate"] == 1.0 and res2["tasks"][1]["success_rate"] == 0.0
+        assert all(ep["sequential_evaluations_per_step"] == cfg.integration_steps + 3
+                   for task_res in res2["tasks"] for ep in task_res["episodes"])
+        assert len(resets2) == 4 and len(calls2) > 0
+        for k, ms in enumerate(resets2):
+            i, trial = divmod(k, 2)
+            assert torch.equal(ms, demo2[i].milestone_frames(trial % len(demo2[i].episodes)).unsqueeze(0))
+        for c in calls2:
+            assert c["frame"].shape == (1, 2, *demo2[0].image_shape)
+            assert torch.equal(c["frame"][0], demo2[c["task"]].frame(0, c["t"]))
+            assert c["out"].num_sequential_evaluations == cfg.integration_steps + 3
+        envs.clear()
+        resets2.clear()
+        evaluate(parse2(["--out", os.path.join(tmp, "eval_two_initial"), "--milestone-source", "initial",
+                         "--task-ids", "1"]), suite=suite, env_factory=factory, pipe=pipe2)
+        assert len(resets2) == 2 and all(ms.shape == (1, 1, 2, *demo2[0].image_shape) for ms in resets2)
+        pipe2.step, pipe2.reset = step2_fn, reset2_fn
+        for ds in demo_ds + demo2:
             ds.close()
         _close_logging()
     print("eval.py self-test passed")

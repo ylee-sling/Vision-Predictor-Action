@@ -14,6 +14,10 @@ change any math.
 | `predictor.py` | Secs. 4.3, 5.2, Eqs. 10, 11, 18, 19 | `JEPAPredictor` (N_e-head ensemble, σ_{t+1}), `VICRegLoss` |
 | `solver.py` | Secs. 4.4, 4.5, Eqs. 12–15 | `FlowMatchingSolver` (v_θ, Euler K-step `generate_chunk`), `standardize_latents`, `UncertaintyHorizonFilter` |
 | `pipeline.py` | Fig. 2, Prop. 5.1 | `VPAConfig`, `VPAInferencePipeline` (`reset`, `step`, `act`) |
+| `dataset.py`, `train.py`, `eval.py` | Secs. 3–4, 6 | LIBERO data, two-stage training, closed-loop evaluation (`eval_fixed_horizon.py` only forwards to `eval.py`) |
+| `pretrained_encoder.py` | — | optional DINOv2 initialisation of E_ψ |
+| `tests/regression_single_cam.py` | — | single-camera outputs must be bit-identical to the `single-cam-baseline` tag |
+| `scripts/` | — | one- vs two-camera ablation (`camera_ablation.sh`, `summarize_ablation.py`) |
 | `docs/preprint_261008.pdf` | — | the paper (ground truth) |
 
 ## Environment (Mac mini M4, Apple Silicon)
@@ -47,6 +51,13 @@ for f in perception selector predictor solver pipeline; do python "$f.py" || bre
 # One module
 python solver.py
 
+# Data, training and evaluation self-tests (synthetic LIBERO-format files; need h5py, not LIBERO)
+python dataset.py && python pretrained_encoder.py && python train.py --self-test && python eval.py --self-test
+
+# Single-camera regression against the baseline tag (must print PASS)
+git tag single-cam-baseline 5729a11 2>/dev/null || true
+python tests/regression_single_cam.py
+
 # Lint (must pass)
 ruff check --select F,E9,B,PLE,PLW .
 ```
@@ -68,7 +79,11 @@ Done:
 4. An independent equation-by-equation audit against the PDF found no discrepancies. The
    interpretive choices it surfaced are listed under "Decisions where the paper is silent".
 
-Open (see the README roadmap): training loops and checkpoints, the Section 6 evaluation
+Multi-camera support (`--camera-keys`, `VPAConfig.num_views`, see "Camera views" below) was written in an
+environment without PyTorch: it passes the lint, but its self-tests and the single-camera regression test
+(`tests/regression_single_cam.py`) have not been run yet. Run every command above before training with it.
+
+Open (see the README roadmap): trained checkpoints and results, the Section 6 evaluation
 (Isaac Sim, ManiSkill3), the per-milestone time-out and spectral normalization.
 
 ## Non-negotiable rules
@@ -153,9 +168,25 @@ Numerics and estimators:
   float32 even for float64 input, and the H_t floor can differ from exact arithmetic by one exactly
   at an integer boundary.
 
+Camera views:
+
+- The paper's I_t is one frame; that is the default (`num_views = 1`) and must stay bit-identical to the
+  `single-cam-baseline` tag (same shapes, parameter names, initialization and outputs). Check with
+  `tests/regression_single_cam.py` after any change to perception, pipeline, dataset, train or eval.
+- With V ≥ 2 cameras, I_t is the tuple of V views in `camera_keys` order, and so is every milestone frame,
+  the JEPA target I_{t+ν} and every frame of the latent cache. E_ψ = one linear head on the concatenation
+  of the per-view [CLS] tokens of one shared ViT body (no per-view weights, no view embedding). The views go
+  through the body inside one E_ψ call (`VisionEncoder._cls_features` is a plain method), so the depth
+  audit still sees K + 3. Everything after z is unchanged.
+- Same preprocessing for every view (the 180° rotation too); all views must have the same stored frame size.
+- The camera keys are recorded in the checkpoint (`extra["data"]["camera_keys"]`; older checkpoints have a
+  single `camera_key`, read by `train.camera_keys_of`). Resuming with other cameras raises; `eval.py` takes
+  the cameras from the checkpoint.
+
 Architectures the paper leaves open:
 
-- E_ψ: pre-norm ViT; the latent is a linear head on the final LayerNorm'd [CLS] token.
+- E_ψ: pre-norm ViT; the latent is a linear head on the final LayerNorm'd [CLS] token (on the
+  concatenated per-view [CLS] tokens when `num_views` ≥ 2).
 - E_ψ̄: starts as an exact copy of ψ; buffers are copied, not EMA-averaged (the ViT has none).
 - c_text: CLIP's projected `text_embeds`, not L2-normalized, padded and truncated at 77 tokens.
 - P_ω: N_e GELU-MLP heads, each with its own primitive embedding (N(0,1) init, separate from the
@@ -166,6 +197,8 @@ Architectures the paper leaves open:
 ## Conventions
 
 - Images are channels-first: `[B, C, H_img, W_img]`. Milestones are `[B, M, C, H_img, W_img]`.
+  With V ≥ 2 camera views a view axis follows the batch (and milestone) axes: `[B, V, C, H_img, W_img]`,
+  `[B, M, V, C, H_img, W_img]`. With one camera there is no view axis (`VisionEncoder.frame_shape`).
 - The milestone pointer `m_t` is 1-based, as in the paper. It is converted to 0-based only for `gather`.
 - γ̄* is installed once through `VPAInferencePipeline.calibrate`, which sets the tracker, the
   predictor and the solver together. Don't set them individually.

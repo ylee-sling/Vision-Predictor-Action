@@ -19,16 +19,28 @@ The text encoder is not on the per-step chain (c_text is computed once per episo
 an offline stand-in with d_c = 512 (the CLIP ViT-B/32 projection width) is used. Pass --clip to load
 the real CLIP text tower instead (downloads openai/clip-vit-base-patch32 on first use).
 
-Run:  python bench_latency.py [--runs 100] [--warmup 10] [--device mps|cpu] [--clip]
+--num-views V times the multi-camera encoder (V camera views per observation, ``VPAConfig.num_views``):
+E_psi then runs its ViT body on V frames per step (one evaluation, so the depth is still K + 3); the
+other stages are unchanged. Run it with 1 and with 2 to report t_E for both camera settings.
+
+--config-json takes the model sizes from a JSON file instead of the VPAConfig placeholders: either a
+JSON object of VPAConfig fields or the ``config.json`` a training run writes (its "config" entry), so
+the timings use the architecture that was actually trained (image size, patch size, widths, num_views).
+H and K are still swept; --num-views, if given, overrides the file.
+
+Run:  python bench_latency.py [--runs 100] [--warmup 10] [--device mps|cuda|cpu] [--clip] [--num-views 1|2]
+                              [--config-json runs/<run>/config.json]
 Not part of the self-tests.
 """
 
 from __future__ import annotations
 
 import argparse
+import dataclasses
+import json
 import statistics
 import time
-from typing import Callable, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
 import torch
 
@@ -43,6 +55,9 @@ STAGES = ("E_psi", "pi_phi_h", "P_omega", "v_theta")
 def _pick_device(requested: str) -> torch.device:
     if requested == "mps" and not torch.backends.mps.is_available():
         print("MPS is not available; falling back to CPU")
+        return torch.device("cpu")
+    if requested == "cuda" and not torch.cuda.is_available():
+        print("CUDA is not available; falling back to CPU")
         return torch.device("cpu")
     return torch.device(requested)
 
@@ -86,16 +101,41 @@ def _attach_timers(pipe: VPAInferencePipeline, sync: Callable[[], None]) -> Dict
     return times
 
 
-def bench(h: int, k: int, device: torch.device, runs: int, warmup: int, use_clip: bool) -> Dict[str, float]:
+def load_config_values(path: str) -> Dict[str, Any]:
+    """VPAConfig fields from a JSON object of fields or from a training run's ``config.json``."""
+    with open(path, encoding="utf-8") as f:
+        values = json.load(f)
+    if "config" in values and isinstance(values["config"], dict):
+        values = values["config"]
+    known = {f.name for f in dataclasses.fields(VPAConfig)}
+    unknown = sorted(set(values) - known)
+    if unknown:
+        raise ValueError(f"unknown VPAConfig fields in {path}: {unknown}")
+    for key in ("image_size", "selector_hidden"):
+        if key in values:
+            values[key] = tuple(int(v) for v in values[key])
+    return values
+
+
+def bench(h: int, k: int, device: torch.device, runs: int, warmup: int, use_clip: bool,
+          num_views: Optional[int] = None, base: Optional[Dict[str, Any]] = None) -> Dict[str, float]:
     torch.manual_seed(0)
-    cfg = VPAConfig(horizon=h, integration_steps=k)  # all other values: VPAConfig placeholders
+    values = dict(base or {})                            # default: VPAConfig placeholders
+    values.update(horizon=h, integration_steps=k)
+    if num_views is not None:
+        values["num_views"] = num_views
+    if values.get("min_horizon", VPAConfig.min_horizon) > h:   # keep H_min <= H when sweeping H
+        values["min_horizon"] = h
+    if values.get("predictor_stride", VPAConfig.predictor_stride) > values.get("min_horizon", VPAConfig.min_horizon):
+        values["predictor_stride"] = values.get("min_horizon", VPAConfig.min_horizon)
+    cfg = VPAConfig(**values)
     pipe = _build(cfg, device, use_clip)
     sync = _synchronizer(device)
     times = _attach_timers(pipe, sync)
-    c, (hi, wi) = cfg.in_channels, cfg.image_size
+    frame_shape = pipe.vision_encoder.frame_shape        # [C, H, W], or [V, C, H, W] with V cameras
     gen = torch.Generator().manual_seed(1)
-    milestones = torch.randn(1, 2, c, hi, wi, generator=gen).to(device)
-    obs = torch.randn(1, c, hi, wi, generator=gen).to(device)
+    milestones = torch.randn(1, 2, *frame_shape, generator=gen).to(device)
+    obs = torch.randn(1, *frame_shape, generator=gen).to(device)
     state = torch.randn(1, cfg.proprio_dim, generator=gen).to(device)
     pipe.reset("pick up the cup", milestones)
 
@@ -125,13 +165,22 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--runs", type=int, default=100)
     parser.add_argument("--warmup", type=int, default=10)
-    parser.add_argument("--device", default="mps", choices=("mps", "cpu"))
+    parser.add_argument("--device", default="mps", choices=("mps", "cuda", "cpu"))
     parser.add_argument("--clip", action="store_true", help="use the real CLIP text encoder (network)")
+    parser.add_argument("--num-views", type=int,
+                        help="camera views per observation (VPAConfig.num_views; default 1 or the --config-json value)")
+    parser.add_argument("--config-json", help="VPAConfig fields, or a training run's config.json")
     args = parser.parse_args()
+    if args.num_views is not None and args.num_views < 1:
+        parser.error("--num-views must be >= 1")
+    sizes_from = load_config_values(args.config_json) if args.config_json else {}
+    views = args.num_views if args.num_views is not None else int(sizes_from.get("num_views", 1))
     device = _pick_device(args.device)
 
-    print("RANDOM-WEIGHT TIMINGS, NOT RESULTS: untrained weights, VPAConfig placeholder sizes, batch 1.")
-    print(f"torch {torch.__version__}, device {device}, median of {args.runs} runs after {args.warmup} warm-up")
+    sizes = f"model sizes from {args.config_json}" if args.config_json else "VPAConfig placeholder sizes"
+    print(f"RANDOM-WEIGHT TIMINGS, NOT RESULTS: untrained weights, {sizes}, batch 1.")
+    print(f"torch {torch.__version__}, device {device}, median of {args.runs} runs after {args.warmup} warm-up, "
+          f"{views} camera view(s)")
     print("Each stage is timed with a device sync before every clock read (Eq. 17 components, ms).\n")
     header = f"{'K':>2} {'H':>4} | {'t_E':>7} {'t_h':>7} {'t_P':>7} {'t_l(H)':>7} | {'Eq.17 sum':>9} {'step()':>8}"
     print(header)
@@ -140,7 +189,7 @@ def main() -> None:
     with torch.inference_mode():
         for k in INTEGRATION_STEPS:
             for h in HORIZONS:
-                r = bench(h, k, device, args.runs, args.warmup, args.clip)
+                r = bench(h, k, device, args.runs, args.warmup, args.clip, views, sizes_from)
                 results[(k, h)] = r
                 print(f"{k:>2} {h:>4} | {r['E_psi']:7.3f} {r['pi_phi_h']:7.3f} {r['P_omega']:7.3f} "
                       f"{r['v_theta']:7.3f} | {r['eq17']:9.3f} {r['step']:8.3f}")

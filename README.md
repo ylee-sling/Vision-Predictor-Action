@@ -92,7 +92,7 @@ E_ψ → π_φ^h → P_ω → v_θ (K times): **K + 3 sequential evaluations reg
 
 | Paper | File | Class / function |
 |---|---|---|
-| Eq. 7, shared (Siamese) vision encoder E_ψ | `perception.py` | `VisionEncoder.forward`, `encode_milestones`, `encode_siamese` |
+| Eq. 7, shared (Siamese) vision encoder E_ψ | `perception.py` | `VisionEncoder.forward`, `encode_milestones`, `encode_siamese` (one camera, or V views fused in the head; see [Camera views](#camera-views-one-or-two-cameras)) |
 | Text embedding c_text (Sec. 4.1) | `perception.py` | `TextEncoderWrapper` |
 | Momentum target E_ψ̄ and stop-gradient (Eq. 11, Fig. 3) | `perception.py` | `MomentumEncoder.update`, `MomentumEncoder.forward` |
 | Eq. 8, primitive selection | `selector.py` | `NeuroSymbolicSelector.select` (`forward`, `probabilities`, `loss`) |
@@ -185,6 +185,67 @@ t=0: u_t=7, H_t=15, m_t=1, sequential evaluations=5
 step. The exact primitive and H_t vary from run to run because the weights are random. `sequential evaluations=5`
 is K + 3 with the default K = 2.
 
+## Camera views (one or two cameras)
+
+The paper writes the observation I_t as a single frame. That is the default here: one camera,
+`agentview_rgb` on LIBERO, frames `[B, C, H, W]`. The code can also take I_t as the tuple of V camera views,
+for example the third-person and the wrist camera, so that both settings can be trained and reported with the
+same code:
+
+| | one camera (default) | two cameras |
+|---|---|---|
+| `train.py` | `--camera-keys agentview_rgb` (or nothing) | `--camera-keys agentview_rgb eye_in_hand_rgb` |
+| `VPAConfig.num_views` | 1 | 2 (set from the data) |
+| observation I_t | `[B, C, H, W]` | `[B, V, C, H, W]` |
+| milestones I_g^(1..M) | `[B, M, C, H, W]` | `[B, M, V, C, H, W]` |
+| E_ψ | ViT → [CLS] → linear head | the same ViT body on every view → [CLS] tokens concatenated in camera order → linear head |
+
+- **Only the encoder's input changes.** E_ψ is still one map from an observation to z ∈ ℝ^d, so Eqs. 8–15, 18 and
+  19 and every module after the encoder are untouched. One ViT body is shared by all views, just as it is
+  shared by observations and milestones, and the head maps the concatenated [CLS] tokens:
+  E_ψ(I) = W · Concat(f(I¹), …, f(I^V)) + b. With V = 2 the head has 2 × 384 inputs instead of 384 (+98k parameters).
+- **The depth stays K + 3.** The views go through the body as one batch inside a single E_ψ call, so the hook audit
+  still sees `[E_ψ, π_φ^h, P_ω] + [v_θ] × K`. The encoder's cost grows roughly linearly with V; measure it with
+  `bench_latency.py --num-views 2`.
+- **Every frame E_ψ sees carries the same views:** I_t, the JEPA target I_{t+ν}, the milestone frames (so z_t and
+  z_g come from the same map, which the Eq. 9a test needs) and the stage-2 latent cache.
+- **With one camera nothing changes:** the same tensor shapes, the same parameter names and shapes, the same
+  random initialization and the same outputs. `tests/regression_single_cam.py` checks this bit for bit against the
+  `single-cam-baseline` tag, and checks that checkpoints written before multi-camera support still load and
+  evaluate identically.
+- The camera keys and their order are stored in the checkpoint. `eval.py` builds I_t from the checkpoint's
+  cameras (there is no camera flag at evaluation), and continuing a checkpoint with other cameras is refused.
+
+## Training and evaluation on LIBERO
+
+`dataset.py` reads LIBERO's HDF5 demonstrations, `train.py` runs the two training stages (stage 1: E_ψ and P_ω
+with Eq. 11; stage 2: π_φ^h and the solver on frozen latents) and `eval.py` runs closed-loop episodes in LIBERO.
+Training needs `h5py`; evaluation needs LIBERO and its simulator (see the docstring of `eval.py`).
+
+```bash
+# one camera (the paper's setting)
+python train.py --data /path/to/LIBERO/datasets/libero_10 --out runs/libero10_1cam
+python eval.py --checkpoint runs/libero10_1cam/policy_final.pt --suite-name libero_10 --num-trials-per-task 50 \
+    --out eval_results/libero10_1cam
+
+# two cameras: the same command plus --camera-keys
+python train.py --data /path/to/LIBERO/datasets/libero_10 --out runs/libero10_2cam \
+    --camera-keys agentview_rgb eye_in_hand_rgb
+python eval.py --checkpoint runs/libero10_2cam/policy_final.pt --suite-name libero_10 --num-trials-per-task 50 \
+    --out eval_results/libero10_2cam
+```
+
+**Camera ablation.** `scripts/camera_ablation.sh` trains and evaluates both settings for several seeds with
+otherwise identical settings (50 episodes per task, one evaluation seed), times both encoders with
+`bench_latency.py`, and writes a summary table with `scripts/summarize_ablation.py` (success mean ± std over
+seeds, pooled rate with a Wilson 95% interval, per-task rates, the premature Eq. 9a completion rate, and the
+two-camera minus one-camera difference paired by seed):
+
+```bash
+DATA=/path/to/LIBERO/datasets/libero_10 bash scripts/camera_ablation.sh
+DATA=... TRAIN_ARGS="--init-encoder dinov2-small --encoder-lr 1e-4" bash scripts/camera_ablation.sh
+```
+
 ## Testing
 
 Each module has a self-test, run on CPU, deterministic (fixed seeds) and offline (an offline stand-in replaces CLIP).
@@ -204,6 +265,16 @@ predictor.py self-test passed
 solver.py self-test passed
 pipeline.py self-test passed
 All checks passed!
+```
+
+The data, training and evaluation code has its own self-tests on synthetic LIBERO-format files (they need
+`h5py`; the evaluation test uses a fake environment, so LIBERO is not needed), and the single-camera regression
+test compares this tree with the `single-cam-baseline` tag:
+
+```bash
+python dataset.py && python pretrained_encoder.py && python train.py --self-test && python eval.py --self-test
+git tag single-cam-baseline 5729a11 2>/dev/null || true   # once: the commit before multi-camera support
+python tests/regression_single_cam.py                     # PASS = single-camera outputs are bit-identical
 ```
 
 The tests compare float32 module output with **independent float64 reference computations** written directly from
@@ -275,7 +346,8 @@ How to read it:
   55 of 60 values agreed within 5%, and the largest difference was 19% (one row, K = 1 and H = 32, was high in
   every stage, including t_E, which does not depend on H). Treat differences of that size as run-to-run noise.
 
-Run it yourself with `python bench_latency.py` (options: `--runs`, `--warmup`, `--device cpu`, `--clip`).
+Run it yourself with `python bench_latency.py` (options: `--runs`, `--warmup`, `--device mps|cuda|cpu`, `--clip`,
+`--num-views 2` for the two-camera encoder, `--config-json runs/<run>/config.json` for the sizes of a trained run).
 
 ## Design choices where the paper is silent
 
@@ -322,9 +394,19 @@ The paper fixes the equations but leaves some details open. This implementation 
   float32 even for float64 input, and the H_t floor can differ from exact arithmetic by one exactly
   at an integer boundary.
 
+**Camera views**
+
+- The paper's I_t is one frame; that is the default (V = 1). With V ≥ 2 cameras, I_t and every milestone
+  frame are the tuple of the same views in the same order (`--camera-keys` order), and E_ψ is a shared ViT body
+  on each view with one linear head on the concatenated [CLS] tokens (no per-view weights, no learned view
+  embedding: the head tells the views apart by their position). See [Camera views](#camera-views-one-or-two-cameras).
+- All views get the same preprocessing (LIBERO renders the wrist camera upside down too, so the 180° rotation
+  applies to every view) and must have the same stored frame size.
+
 **Architectures the paper leaves open**
 
-- E_ψ: pre-norm ViT; the latent is a linear head on the final LayerNorm'd [CLS] token.
+- E_ψ: pre-norm ViT; the latent is a linear head on the final LayerNorm'd [CLS] token (on the concatenated
+  [CLS] tokens of the views when V ≥ 2).
 - E_ψ̄: starts as an exact copy of ψ; buffers are copied, not EMA-averaged (the ViT has none).
 - c_text: CLIP's projected `text_embeds`, not L2-normalized, padded and truncated at 77 tokens.
 - P_ω: N_e GELU-MLP heads, each with its own primitive embedding (N(0,1) init, separate from the
@@ -334,8 +416,9 @@ The paper fixes the equations but leaves some details open. This implementation 
 
 ## Not yet implemented / roadmap
 
-- **Training pipelines.** The losses exist (`VICRegLoss`, `FlowMatchingSolver.flow_matching_loss`,
-  `NeuroSymbolicSelector.loss`), but there are no data loaders, training loops or trained checkpoints yet.
+- **Trained models and results.** LIBERO data loading, the two-stage training loop and closed-loop LIBERO
+  evaluation exist (`dataset.py`, `train.py`, `eval.py`, one or two cameras), but no trained checkpoints or
+  success rates are published yet.
 - **Section 6 evaluation** in simulation (NVIDIA Isaac Sim, ManiSkill3): task success, latency on target hardware,
   encoder-regularity constants and phase-onset residuals.
 - **Per-milestone time-out** for detecting stalled milestones (deferred in Secs. 4.2 and 6 of the paper).
@@ -350,7 +433,18 @@ vpa-pytorch/
 ├── predictor.py          # Stage 3: JEPAPredictor (P_ω, σ), VICRegLoss (Eqs. 11, 18, 19)
 ├── solver.py             # Stage 4: FlowMatchingSolver (Eq. 12, v_θ, Euler), UncertaintyHorizonFilter (Eq. 15)
 ├── pipeline.py           # VPAConfig, VPAInferencePipeline (reset, step, act, calibrate)
+├── dataset.py            # LIBERO HDF5 demonstrations (one or several camera views)
+├── train.py              # two-stage training (stage 1: E_ψ, P_ω; stage 2: π_φ^h, solver), --camera-keys
+├── eval.py               # closed-loop LIBERO evaluation, Eq. 15 options (--fixed-horizon, --beta, --suggest-beta)
+├── eval_fixed_horizon.py # forwards to eval.py (kept so older commands keep working)
+├── pretrained_encoder.py # optional DINOv2 initialisation of E_ψ (--init-encoder)
 ├── bench_latency.py      # Eq. 17 latency benchmark (not part of the self-tests)
+├── tests/
+│   ├── regression_single_cam.py   # single-camera outputs must be bit-identical to the single-cam-baseline tag
+│   └── dump_reference_outputs.py  # deterministic outputs of one source tree (used by the regression test)
+├── scripts/
+│   ├── camera_ablation.sh         # one vs two cameras: train, evaluate, benchmark, summarize
+│   └── summarize_ablation.py      # success table from eval_metrics.json files
 ├── requirements.txt      # torch, transformers (pinned)
 ├── requirements-dev.txt  # + ruff
 ├── CLAUDE.md             # development rules and design decisions

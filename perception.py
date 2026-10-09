@@ -17,7 +17,9 @@ Implements
 Layout convention
     The paper writes I_t in R^{H_img x W_img x C}. PyTorch convolutions are channels-first, so
     every image tensor in this module is ``[Batch, C, H_img, W_img]``; a milestone sequence is
-    ``[Batch, M, C, H_img, W_img]``.
+    ``[Batch, M, C, H_img, W_img]``. With V >= 2 camera views (``VisionEncoder(num_views=V)``), a
+    view axis follows the batch (and milestone) axes: ``[Batch, V, C, H_img, W_img]`` and
+    ``[Batch, M, V, C, H_img, W_img]``. With one camera there is no view axis.
 
 This file is self-contained (it imports nothing from the other VPA modules) and can be tested
 on its own with ``python perception.py``.
@@ -122,7 +124,20 @@ class VisionEncoder(nn.Module):
         z_t     = E_psi(I_t)          in R^d
         z_g^(m) = E_psi(I_g^(m))      in R^d,   m = 1, ..., M
 
-    The latent is the linear projection of the final [CLS] token after the last LayerNorm.
+    Single camera (``num_views = 1``, the paper's setting): the latent is the linear projection of
+    the final [CLS] token after the last LayerNorm.
+
+    Several cameras (``num_views = V >= 2``; a decision where the paper is silent). The paper writes
+    I_t as one frame. With V cameras, I_t is the ordered tuple of the V views (I_t^1, ..., I_t^V),
+    and every milestone I_g^(m) is the tuple of the same views in the same order. One ViT body
+    (shared by all views, as it is shared by observations and milestones) yields the final
+    LayerNorm'd [CLS] token f(I^v) of each view, and the head maps their concatenation in view order:
+
+        E_psi(I) = W_head Concat(f(I^1), ..., f(I^V)) + b_head,    W_head in R^{d x V D_vit}
+
+    So E_psi is still a single map from an observation to R^d, and everything downstream of z
+    (Eqs. 8-15, 18, 19) is unchanged. With V = 1 this is exactly the single-camera encoder: no extra
+    module, the same parameter names and shapes, and the same frame shape ``[C, H_img, W_img]``.
 
     Args:
         image_size: (H_img, W_img) or int.
@@ -133,11 +148,12 @@ class VisionEncoder(nn.Module):
         num_heads: attention heads per block.
         latent_dim: dimension d of the latent space Z.
         mlp_ratio: hidden width multiplier of the block MLPs.
+        num_views: number of camera views V per frame (1 = single camera).
 
-    Shapes:
-        ``forward``:          ``[B, C, H_img, W_img]`` -> ``[B, d]``
-        ``encode_milestones``: ``[B, M, C, H_img, W_img]`` -> ``[B, M, d]``
-        ``encode_siamese``:   (``[B, C, H_img, W_img]``, ``[B, M, C, H_img, W_img]``)
+    Shapes (``frame_shape`` = ``[C, H_img, W_img]`` if V = 1, ``[V, C, H_img, W_img]`` if V >= 2):
+        ``forward``:          ``[B, *frame_shape]`` -> ``[B, d]``
+        ``encode_milestones``: ``[B, M, *frame_shape]`` -> ``[B, M, d]``
+        ``encode_siamese``:   (``[B, *frame_shape]``, ``[B, M, *frame_shape]``)
                               -> (``[B, d]``, ``[B, M, d]``)
     """
 
@@ -151,10 +167,14 @@ class VisionEncoder(nn.Module):
         num_heads: int = 6,
         latent_dim: int = 256,
         mlp_ratio: float = 4.0,
+        num_views: int = 1,
     ) -> None:
         super().__init__()
+        if int(num_views) != num_views or int(num_views) < 1:
+            raise ValueError(f"num_views must be an integer >= 1, got {num_views}")
         self.in_channels: int = in_channels
         self.latent_dim: int = latent_dim
+        self.num_views: int = int(num_views)
         self.patch_embed = PatchEmbedding(image_size, patch_size, in_channels, width)
         self.image_size: Tuple[int, int] = self.patch_embed.image_size
         self.cls_token = nn.Parameter(torch.zeros(1, 1, width))
@@ -163,7 +183,7 @@ class VisionEncoder(nn.Module):
             [TransformerBlock(width, num_heads, mlp_ratio) for _ in range(depth)]
         )
         self.norm = nn.LayerNorm(width)
-        self.head = nn.Linear(width, latent_dim)
+        self.head = nn.Linear(self.num_views * width, latent_dim)  # V = 1: Linear(D_vit, d) as before
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -178,47 +198,65 @@ class VisionEncoder(nn.Module):
                 nn.init.ones_(module.weight)
                 nn.init.zeros_(module.bias)
 
+    @property
+    def frame_shape(self) -> Tuple[int, ...]:
+        """Shape of one observation: ``(C, H_img, W_img)`` if V = 1, ``(V, C, H_img, W_img)`` if V >= 2."""
+        c, (h, w) = self.in_channels, self.image_size
+        return (c, h, w) if self.num_views == 1 else (self.num_views, c, h, w)
+
     def _check_frames(self, images: Tensor) -> None:
-        if images.dim() != 4:
-            raise ValueError(f"expected images of shape [B, C, H, W], got {tuple(images.shape)}")
-        _, c, h, w = images.shape
-        if c != self.in_channels or (h, w) != self.image_size:
+        expected = self.frame_shape
+        if images.dim() != 1 + len(expected) or tuple(images.shape[1:]) != expected:
+            layout = "[B, C, H, W]" if self.num_views == 1 else "[B, V, C, H, W]"
             raise ValueError(
-                f"expected frames [B, {self.in_channels}, {self.image_size[0]}, {self.image_size[1]}], "
+                f"expected frames {layout} = [B, {', '.join(str(s) for s in expected)}], "
                 f"got {tuple(images.shape)}"
             )
 
+    def _cls_features(self, images: Tensor) -> Tensor:
+        """ViT body on single-view frames: ``[N, C, H_img, W_img]`` -> ``[N, D_vit]``.
+
+        Returns the final LayerNorm'd [CLS] token. A plain method, not a submodule, so a
+        multi-view forward is still one evaluation of E_psi for the depth audit (Prop. 5.1).
+        """
+        x = self.patch_embed(images)  # [N, N_patch, D_vit]
+        cls = self.cls_token.expand(x.shape[0], -1, -1)  # [N, 1, D_vit]
+        x = torch.cat([cls, x], dim=1) + self.pos_embed  # [N, N_patch + 1, D_vit]
+        for block in self.blocks:
+            x = block(x)
+        x = self.norm(x)
+        return x[:, 0]  # [N, D_vit]
+
     def forward(self, images: Tensor) -> Tensor:
-        """Encode a batch of frames.
+        """Encode a batch of observations (Eq. 7).
 
         Args:
-            images: ``[B, C, H_img, W_img]`` float frames (observations and/or milestone goals).
+            images: ``[B, C, H_img, W_img]`` (V = 1) or ``[B, V, C, H_img, W_img]`` (V >= 2) float
+                frames (observations and/or milestone goals).
 
         Returns:
             z: ``[B, d]`` latent embeddings E_psi(I).
         """
         self._check_frames(images)
-        x = self.patch_embed(images)  # [B, N_patch, D_vit]
-        cls = self.cls_token.expand(x.shape[0], -1, -1)  # [B, 1, D_vit]
-        x = torch.cat([cls, x], dim=1) + self.pos_embed  # [B, N_patch + 1, D_vit]
-        for block in self.blocks:
-            x = block(x)
-        x = self.norm(x)
-        return self.head(x[:, 0])  # [B, d]
+        if self.num_views == 1:
+            return self.head(self._cls_features(images))  # [B, d]
+        b = images.shape[0]
+        # all B * V views through the shared body in one batch (row b * V + v is view v of sample b)
+        cls = self._cls_features(images.flatten(0, 1))  # [B * V, D_vit]
+        return self.head(cls.reshape(b, self.num_views * cls.shape[-1]))  # Concat in view order -> [B, d]
 
     def encode_milestones(self, milestones: Tensor) -> Tensor:
         """Encode an ordered milestone sequence (computed once per episode, Sec. 4.1).
 
         Args:
-            milestones: ``[B, M, C, H_img, W_img]`` -- (I_g^(1), ..., I_g^(M)) per batch element.
+            milestones: ``[B, M, *frame_shape]`` -- (I_g^(1), ..., I_g^(M)) per batch element.
 
         Returns:
             z_g: ``[B, M, d]`` -- (z_g^(1), ..., z_g^(M)).
         """
-        if milestones.dim() != 5:
-            raise ValueError(
-                f"expected milestones of shape [B, M, C, H, W], got {tuple(milestones.shape)}"
-            )
+        if milestones.dim() != 2 + len(self.frame_shape):
+            layout = "[B, M, C, H, W]" if self.num_views == 1 else "[B, M, V, C, H, W]"
+            raise ValueError(f"expected milestones of shape {layout}, got {tuple(milestones.shape)}")
         b, m = milestones.shape[:2]
         z = self(milestones.reshape(b * m, *milestones.shape[2:]))  # [B*M, d]
         return z.reshape(b, m, self.latent_dim)
@@ -231,14 +269,17 @@ class VisionEncoder(nn.Module):
         the result is identical to encoding the two streams separately.
 
         Args:
-            observation: ``[B, C, H_img, W_img]`` -- current frames I_t.
-            milestones:  ``[B, M, C, H_img, W_img]`` -- milestone frames I_g^(1..M).
+            observation: ``[B, *frame_shape]`` -- current frames I_t.
+            milestones:  ``[B, M, *frame_shape]`` -- milestone frames I_g^(1..M).
 
         Returns:
             z_t: ``[B, d]``;  z_g: ``[B, M, d]``.
         """
-        if observation.dim() != 4 or milestones.dim() != 5:
-            raise ValueError("expected observation [B, C, H, W] and milestones [B, M, C, H, W]")
+        n = len(self.frame_shape)
+        if observation.dim() != 1 + n or milestones.dim() != 2 + n:
+            if self.num_views == 1:
+                raise ValueError("expected observation [B, C, H, W] and milestones [B, M, C, H, W]")
+            raise ValueError("expected observation [B, V, C, H, W] and milestones [B, M, V, C, H, W]")
         b, m = milestones.shape[:2]
         if observation.shape[0] != b:
             raise ValueError(f"batch mismatch: observation {observation.shape[0]} vs milestones {b}")
@@ -261,7 +302,8 @@ class MomentumEncoder(nn.Module):
     detached tensor, which realises the stop-gradient sg(.) of Eq. 11.
 
     Shapes:
-        ``forward``: ``[B, C, H_img, W_img]`` -> ``[B, d]`` (detached)
+        ``forward``: ``[B, *frame_shape]`` -> ``[B, d]`` (detached); ``frame_shape`` is the online
+        encoder's (``[C, H_img, W_img]``, or ``[V, C, H_img, W_img]`` with V camera views).
     """
 
     def __init__(self, online_encoder: VisionEncoder, momentum: float = 0.996) -> None:
@@ -282,7 +324,7 @@ class MomentumEncoder(nn.Module):
 
     @torch.no_grad()
     def forward(self, images: Tensor) -> Tensor:
-        """``[B, C, H_img, W_img]`` -> ``[B, d]`` target latents sg(E_psi_bar(I))."""
+        """``[B, *frame_shape]`` -> ``[B, d]`` target latents sg(E_psi_bar(I))."""
         return self.encoder(images).detach()
 
 
@@ -434,12 +476,12 @@ def _ref_layer_norm(x: Tensor, weight: Tensor, bias: Tensor, eps: float) -> Tens
     return (x - mean) / torch.sqrt(var + eps) * weight + bias
 
 
-def _ref_vit_forward(enc: VisionEncoder, images: Tensor) -> Tensor:
-    """Independent float64 reference of z = E_psi(I) (Eq. 7) for one frame batch ``[B, C, H, W]``.
+def _ref_vit_cls(enc: VisionEncoder, images: Tensor) -> Tensor:
+    """Independent float64 reference of the ViT body on single-view frames ``[B, C, H, W]``.
 
     Re-derives the ViT forward from its definition with float64 copies of the module weights:
     explicit patch loops, per-head softmax attention, exact erf-GELU, hand-written LayerNorm.
-    Returns ``[B, d]`` float64.
+    Returns the final LayerNorm'd [CLS] token, ``[B, D_vit]`` float64.
     """
     f64 = {k: v.detach().double() for k, v in enc.state_dict().items()}
     x = images.double()
@@ -476,7 +518,23 @@ def _ref_vit_forward(enc: VisionEncoder, images: Tensor) -> Tensor:
         hid = 0.5 * hid * (1.0 + torch.erf(hid / 2.0 ** 0.5))  # exact GELU
         t = t + hid @ f64[pre + "mlp.2.weight"].T + f64[pre + "mlp.2.bias"]
     t = _ref_layer_norm(t, f64["norm.weight"], f64["norm.bias"], enc.norm.eps)
-    return t[:, 0] @ f64["head.weight"].T + f64["head.bias"]  # [B, d]
+    return t[:, 0]  # [B, D_vit]
+
+
+def _ref_vit_forward(enc: VisionEncoder, images: Tensor) -> Tensor:
+    """Independent float64 reference of z = E_psi(I) (Eq. 7).
+
+    ``[B, C, H, W]`` (one camera): the head applied to the [CLS] token.
+    ``[B, V, C, H, W]`` (V cameras): the [CLS] tokens of the V views, each from its own body pass,
+    concatenated in view order, then the head. Returns ``[B, d]`` float64.
+    """
+    w_head = enc.head.weight.detach().double()
+    b_head = enc.head.bias.detach().double()
+    if images.dim() == 4:
+        feats = _ref_vit_cls(enc, images)  # [B, D_vit]
+    else:
+        feats = torch.cat([_ref_vit_cls(enc, images[:, v]) for v in range(images.shape[1])], dim=-1)  # [B, V*D_vit]
+    return feats @ w_head.T + b_head  # [B, d]
 
 
 def _self_test() -> None:
@@ -582,6 +640,58 @@ def _self_test() -> None:
         for j in range(i + 1, len(texts)):
             assert not torch.allclose(c_text[i], c_text[j])
     _expect_value_error(lambda: text([]))
+
+    # ---- Several cameras (num_views = V = 2): one shared ViT body for every view, the head maps the
+    # concatenated [CLS] tokens in view order. Own generator, so the checks above are unaffected.
+    gen2 = torch.Generator().manual_seed(4321)
+    v = 2
+    enc2 = VisionEncoder(image_size=(h, w), patch_size=8, in_channels=c, width=32, depth=2,
+                         num_heads=4, latent_dim=d, num_views=v).eval()
+    assert enc.num_views == 1 and enc.frame_shape == (c, h, w)
+    assert enc2.num_views == v and enc2.frame_shape == (v, c, h, w)
+    assert enc.head.in_features == 32 and enc2.head.in_features == v * 32
+    # the same parameters as the single-camera encoder, except the head's input width
+    shapes1 = {k: tuple(p.shape) for k, p in enc.named_parameters()}
+    shapes2 = {k: tuple(p.shape) for k, p in enc2.named_parameters()}
+    assert shapes1.keys() == shapes2.keys()
+    assert all(shapes1[k] == shapes2[k] for k in shapes1 if not k.startswith("head."))
+    obs2 = torch.randn(b, v, c, h, w, generator=gen2)
+    goals2 = torch.randn(b, m, v, c, h, w, generator=gen2)
+    with torch.no_grad():
+        z2_t = enc2(obs2)
+        z2_g = enc2.encode_milestones(goals2)
+        zs2_t, zs2_g = enc2.encode_siamese(obs2, goals2)
+        z2_swapped = enc2(obs2.flip(1))                                   # views in the other order
+        z2_single = enc2(obs2[1:2])                                       # B = 1
+    assert z2_t.shape == (b, d) and z2_g.shape == (b, m, d) and zs2_t.shape == (b, d) and zs2_g.shape == (b, m, d)
+    ref2_t = _ref_vit_forward(enc2, obs2)
+    assert _close(z2_t, ref2_t) and _close(zs2_t, ref2_t) and _close(z2_single, ref2_t[1:2])
+    for bi in range(b):
+        for mi in range(m):
+            ref_g = _ref_vit_forward(enc2, goals2[bi, mi].unsqueeze(0))[0]
+            assert _close(z2_g[bi, mi], ref_g) and _close(zs2_g[bi, mi], ref_g)
+    # the head sees the views in camera order: swapping them changes z
+    assert not torch.allclose(z2_swapped, z2_t, rtol=1e-3, atol=1e-4)
+    assert _close(z2_swapped, _ref_vit_forward(enc2, obs2.flip(1)))
+    # a view axis is required with V >= 2 and rejected with V = 1; the view count must match
+    _expect_value_error(lambda: enc2(obs))                                          # no view axis
+    _expect_value_error(lambda: enc2(torch.randn(b, v + 1, c, h, w)))               # wrong V
+    _expect_value_error(lambda: enc2(torch.randn(b, v, c, h + 8, w)))               # wrong frame size
+    _expect_value_error(lambda: enc2.encode_milestones(goals))                      # [B, M, C, H, W]
+    _expect_value_error(lambda: enc2.encode_siamese(obs2, goals))                   # single-view milestones
+    _expect_value_error(lambda: enc2.encode_siamese(obs, goals2))                   # single-view observation
+    _expect_value_error(lambda: enc(obs2))                                          # V = 1 rejects a view axis
+    _expect_value_error(lambda: enc.encode_milestones(goals2))
+    _expect_value_error(lambda: VisionEncoder(image_size=(h, w), patch_size=8, num_views=0))
+    # E_psi_bar of a multi-view encoder: the same map with the EMA weights; gradients reach every view
+    target2 = MomentumEncoder(enc2, momentum=mu)
+    assert _close(target2(obs2), _ref_vit_forward(target2.encoder, obs2))
+    obs2_g = obs2.clone().requires_grad_(True)
+    enc2.zero_grad(set_to_none=True)
+    (enc2(obs2_g) - target2(obs2_g.flip(1))).pow(2).sum().backward()               # non-zero residual
+    assert obs2_g.grad is not None and all(bool(obs2_g.grad[:, vi].abs().sum() > 0) for vi in range(v))
+    assert all(p.grad is not None for p in enc2.parameters())
+    assert all(p.grad is None for p in target2.parameters())
     print("perception.py self-test passed")
 
 
