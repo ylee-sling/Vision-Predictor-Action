@@ -79,9 +79,16 @@ Done:
 4. An independent equation-by-equation audit against the PDF found no discrepancies. The
    interpretive choices it surfaced are listed under "Decisions where the paper is silent".
 
-Multi-camera support (`--camera-keys`, `VPAConfig.num_views`, see "Camera views" below) was written in an
-environment without PyTorch: it passes the lint, but its self-tests and the single-camera regression test
-(`tests/regression_single_cam.py`) have not been run yet. Run every command above before training with it.
+Multi-camera support (`--camera-keys`, `VPAConfig.num_views`, see "Camera views" below), verified on the
+GCP training instance (Linux, CUDA build torch 2.14.1+cu130; tests run on CPU) on 2026-10-09:
+
+5. All nine self-tests pass (perception, selector, predictor, solver, pipeline, dataset,
+   pretrained_encoder, `train.py --self-test`, `eval.py --self-test`), including the new V = 2 cases.
+   The tracebacks `eval.py` prints ("simulated physics failure") are expected: its self-test
+   checks that a simulator crash counts as a failed trial.
+6. `tests/regression_single_cam.py` passes: single-camera outputs are bit-identical to the
+   `single-cam-baseline` tag (1206 checks), and a checkpoint written by the baseline loads and
+   evaluates identically. Re-run it after any change to perception, pipeline, dataset, train or eval.
 
 Open (see the README roadmap): trained checkpoints and results, the Section 6 evaluation
 (Isaac Sim, ManiSkill3), the per-milestone time-out and spectral normalization.
