@@ -1,0 +1,38 @@
+{
+  "description": "Preliminary LIBERO-10 results of the VPA reference implementation: one training run per setting (seed 0), 20 trials per task (200 episodes per entry), eval.py defaults unless stated (max 600 steps, LIBERO's fixed initial states, evaluation seed 0).",
+  "suite": "libero_10",
+  "training": "train.py defaults: randomly initialised ViT E_psi, 128x128 frames, patch 16, 50k stage-1 + 50k stage-2 steps, batch 64, K = 2, H = 16, seed 0",
+  "tasks": [
+    "put both the alphabet soup and the tomato sauce in the basket",
+    "put both the cream cheese box and the butter in the basket",
+    "turn on the stove and put the moka pot on it",
+    "put the black bowl in the bottom drawer of the cabinet and close it",
+    "put the white mug on the left plate and put the yellow and white mug on the right plate",
+    "pick up the book and place it in the back compartment of the caddy",
+    "put the white mug on the plate and put the chocolate pudding to the right of the plate",
+    "put both the alphabet soup and the cream cheese box in the basket",
+    "put both moka pots on the stove",
+    "put the yellow and white mug in the microwave and close it"
+  ],
+  "camera_ablation": {
+    "agentview_rgb": {"successes": 21, "trials": 200, "success_rate": 0.105, "wilson95": [0.070, 0.155],
+                      "per_task": [0.0, 0.0, 0.30, 0.35, 0.0, 0.20, 0.0, 0.0, 0.0, 0.20]},
+    "agentview_rgb+eye_in_hand_rgb": {"successes": 80, "trials": 200, "success_rate": 0.400, "wilson95": [0.335, 0.469],
+                                      "per_task": [0.10, 0.45, 0.40, 0.55, 0.40, 0.50, 0.15, 0.50, 0.45, 0.50]}
+  },
+  "two_camera_execution_horizon": {
+    "fixed_2": {"successes": 32, "trials": 200, "success_rate": 0.160},
+    "fixed_4": {"successes": 52, "trials": 200, "success_rate": 0.260},
+    "fixed_8": {"successes": 67, "trials": 200, "success_rate": 0.335},
+    "eq15_beta_40.39": {"successes": 61, "trials": 200, "success_rate": 0.305},
+    "eq15_default_beta_1 (H_t = 15)": {"successes": 80, "trials": 200, "success_rate": 0.400}
+  },
+  "two_camera_checkpoints": {
+    "step_40000": {"successes": 65, "trials": 200, "success_rate": 0.325},
+    "step_45000": {"successes": 72, "trials": 200, "success_rate": 0.360},
+    "step_50000_final": {"successes": 80, "trials": 200, "success_rate": 0.400}
+  },
+  "two_camera_blindfold": {
+    "agentview_rgb_blacked_out": {"successes": 0, "trials": 200, "success_rate": 0.0}
+  }
+}

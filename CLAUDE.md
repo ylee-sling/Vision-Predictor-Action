@@ -65,7 +65,8 @@ ruff check --select F,E9,B,PLE,PLW .
 ## Current status
 
 Verified on macOS 15 / Apple M4 with Python 3.13, torch 2.14.1 and transformers 5.19.0
-(`requirements.txt`). All networks still have random weights; there are no trained checkpoints.
+(`requirements.txt`). Trained LIBERO-10 checkpoints (one and two cameras) and preliminary results are
+in the README ("Results on LIBERO-10") and `results/libero10_pilot.json`.
 
 Done:
 
