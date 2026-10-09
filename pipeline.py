@@ -17,6 +17,8 @@ from [E_psi, pi_phi^h, P_omega, v_theta x K] in count or order.
 
 Per decision step (Fig. 2):
     1. z_t = E_psi(I_t)                                                       (Eq. 7)
+       (with ``VPAConfig.num_views = V >= 2`` cameras, I_t is the tuple of V views; still one
+       evaluation of E_psi, see ``perception.VisionEncoder``)
     2. u_t = argmax pi_phi^h(u | z_t, z_g^(m_t), c_text)                      (Eq. 8)
     3. (z_hat_{t+1}, sigma_{t+1}) = P_omega(z_t, u_t)                         (Eq. 10)
     4. e_t = Concat(Embed(u_t), z_tilde_t, z_hat_tilde_{t+1}, S_tilde_t, c_text)   (Eq. 12)
@@ -67,6 +69,7 @@ class VPAConfig:
     image_size: Tuple[int, int] = (224, 224)
     patch_size: int = 16
     in_channels: int = 3
+    num_views: int = 1                         # V camera views per observation (1 = the paper's single frame)
     vit_width: int = 384
     vit_depth: int = 6
     vit_heads: int = 6
@@ -207,6 +210,7 @@ class VPAInferencePipeline(nn.Module):
             depth=config.vit_depth,
             num_heads=config.vit_heads,
             latent_dim=d,
+            num_views=config.num_views,
         )
         selector = NeuroSymbolicSelector(d, d_c, config.num_primitives, config.selector_hidden)
         tracker = MilestoneTracker(d, config.kappa, config.alpha_gamma, config.vicreg_eps)
@@ -339,11 +343,14 @@ class VPAInferencePipeline(nn.Module):
 
         Args:
             instructions: one string (shared by the batch) or B strings.
-            milestone_frames: ``[B, M, C, H_img, W_img]`` ordered milestone goal frames.
+            milestone_frames: ``[B, M, C, H_img, W_img]`` ordered milestone goal frames
+                (``[B, M, V, C, H_img, W_img]`` with V >= 2 camera views).
         """
         self._check_calibrated()
-        if milestone_frames.dim() != 5:
-            raise ValueError("milestone_frames must have shape [B, M, C, H_img, W_img]")
+        if milestone_frames.dim() != 2 + len(self.vision_encoder.frame_shape):
+            if self.vision_encoder.num_views == 1:
+                raise ValueError("milestone_frames must have shape [B, M, C, H_img, W_img]")
+            raise ValueError("milestone_frames must have shape [B, M, V, C, H_img, W_img]")
         b, m = milestone_frames.shape[:2]
         device = milestone_frames.device
         c_text = self.text_encoder(instructions).to(device)                    # [B or 1, d_c]
@@ -374,7 +381,8 @@ class VPAInferencePipeline(nn.Module):
         """Run one decision step: Observation -> Encoder -> Selector -> Predictor -> Solver.
 
         Args:
-            observation: ``[B, C, H_img, W_img]`` current frames I_t.
+            observation: ``[B, C, H_img, W_img]`` current frames I_t
+                (``[B, V, C, H_img, W_img]`` with V >= 2 camera views).
             proprioception: ``[B, d_s]`` raw proprioceptive state S_t.
             decision_mask: optional ``[B]`` bool. The networks run for the whole batch, but the
                 filter state, milestone pointer and execution prefix are committed only for
@@ -459,7 +467,8 @@ class VPAInferencePipeline(nn.Module):
         trigger a decision step; the others continue open-loop with their current chunk.
 
         Args:
-            observation: ``[B, C, H_img, W_img]``;  proprioception: ``[B, d_s]``.
+            observation: ``[B, C, H_img, W_img]`` (``[B, V, C, H_img, W_img]`` with V >= 2 views);
+                proprioception: ``[B, d_s]``.
 
         Returns:
             ``ActOutput(action [B, d_a], replanned [B] bool, step_output or None)``.
@@ -508,7 +517,8 @@ def _calibration_stats() -> Tuple[Tensor, Tensor, Tensor]:
 
 
 def _tiny_pipeline(
-    horizon: int, k_steps: int, kappa: float = 0.01, beta: float = 0.5, calibrate: bool = True
+    horizon: int, k_steps: int, kappa: float = 0.01, beta: float = 0.5, calibrate: bool = True,
+    num_views: int = 1,
 ) -> VPAInferencePipeline:
     try:
         from .perception import _ToyTextModel, _toy_tokenizer
@@ -521,7 +531,7 @@ def _tiny_pipeline(
         ensemble_heads=3, predictor_embed_dim=8, predictor_hidden=32, predictor_hidden_layers=1,
         proprio_dim=6, action_dim=3, primitive_embed_dim=8, horizon=horizon, min_horizon=2,
         integration_steps=k_steps, beta=beta, alpha_sigma=0.2,
-        field_width=32, field_depth=2, field_heads=4, time_embed_dim=16,
+        field_width=32, field_depth=2, field_heads=4, time_embed_dim=16, num_views=num_views,
     )
     text = TextEncoderWrapper(text_model=_ToyTextModel(projection_dim=12), tokenizer=_toy_tokenizer)
     pipe = VPAInferencePipeline.from_config(cfg, text_encoder=text)
@@ -756,6 +766,39 @@ def _self_test() -> None:
     pipe.check_vicreg_loss(loss_fn)
     _expect(ValueError, lambda: pipe.check_vicreg_loss(
         VICRegLoss(lambda_v=25.0, lambda_c=1.0, eps=10.0 * pipe.tracker.eps)))
+
+    # ---- Several cameras (VPAConfig.num_views = V = 2): observation [B, V, C, H, W], milestones
+    # [B, M, V, C, H, W]. E_psi is still evaluated once per step, so the depth stays K + 3 (Prop. 5.1).
+    gen_v = torch.Generator().manual_seed(78)
+    nv = 2
+
+    def frames_v(*shape: int) -> Tensor:
+        return torch.randn(*shape, nv, c, h_img, h_img, generator=gen_v)
+
+    for k_steps in (1, 2, 3):
+        pipe_v = _tiny_pipeline(16, k_steps, num_views=nv)
+        assert pipe_v.vision_encoder.frame_shape == (nv, c, h_img, h_img)
+        log = _record_chain(pipe_v)
+        obs_v = frames_v(b)
+        goals_v = frames_v(b, m)
+        goals_v[:, 0] = obs_v                 # milestone 1 (both views) is reached at the first step
+        pipe_v.reset(texts, goals_v)
+        log.clear()
+        out_v = pipe_v.step(obs_v, torch.randn(b, ds, generator=gen_v))
+        assert log == ["E_psi", "pi_phi_h", "P_omega"] + ["v_theta"] * k_steps, log
+        assert out_v.num_sequential_evaluations == k_steps + 3
+        assert out_v.action_chunk.shape == (b, 16, da)
+        with torch.no_grad():
+            assert torch.equal(out_v.z_t, pipe_v.vision_encoder(obs_v))
+            assert torch.equal(pipe_v.milestone_latents, pipe_v.vision_encoder.encode_milestones(goals_v))
+        assert bool((out_v.milestone_distance < 1e-5).all())          # Eq. 9a on the two-view latents
+        assert out_v.next_milestone_pointer.tolist() == [2] * b
+    # wrong layouts are rejected
+    pipe_v = _tiny_pipeline(16, 2, num_views=nv)
+    _expect(ValueError, lambda: pipe_v.reset(texts, frames(b, m)))                 # single-view milestones
+    pipe_v.reset(texts, frames_v(b, m))
+    _expect(ValueError, lambda: pipe_v.step(frames(b), proprio()))                 # single-view observation
+    _expect(ValueError, lambda: _tiny_pipeline(16, 2).reset(texts, frames_v(b, m)))  # two views into V = 1
     print("pipeline.py self-test passed")
 
 if __name__ == "__main__":

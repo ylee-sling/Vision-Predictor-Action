@@ -8,6 +8,7 @@ training objectives consume:
 
     image       I_t        ``[C, H_img, W_img]`` float32 in [0, 1]  E_psi input (Eqs. 1, 7)
     next_image  I_{t+nu}   ``[C, H_img, W_img]`` target frame of Eq. 11 (stride nu, Sec. 3.3)
+                (both ``[V, C, H_img, W_img]`` with V >= 2 camera views, see "Camera views" below)
     proprio     S_t        ``[d_s]``   raw proprioception (Eq. 1; standardised later, Sec. 4.5)
     actions     A_t        ``[H, d_a]`` the next H commands after I_t (Eq. 3; regression target of Eq. 14)
     primitive   u_t        ``[]`` int64 primitive label of the next command (Eq. 10, Sec. 4.2, Fig. 3)
@@ -34,13 +35,22 @@ documented stand-in:
     * milestone frames I_g^(1..M) -- frame indices in ``data/demo_<i>/<milestone_key>``, else the
       final frame (M = 1, the single-stage case of Sec. 3.1), or ``gripper_milestone_indices`` on request.
 
+Camera views. ``camera_keys`` names the cameras that form I_t. With one key (the default,
+``agentview_rgb``) a frame is ``[C, H_img, W_img]``, exactly as before. With V >= 2 keys a frame is
+the stack of the V views in the order of ``camera_keys``, ``[V, C, H_img, W_img]``, and so are
+I_{t+nu}, the milestone frames and the frame blocks of the latent cache (``frame_shape``). Every view
+goes through the same transform (rotation, scaling, resize).
+
 Decisions where the paper is silent (do not change silently):
     * Chunks that run past the end of a demonstration repeat its final action
       (``chunk_padding="repeat"``); ``"drop"`` keeps only fully observed chunks.
     * Samples are restricted to t <= T - 1 - nu, so every sample has a real target frame I_{t+nu};
       since nu >= 1, the first command actions[t + 1] also always exists.
     * Frames are scaled to [0, 1] and not normalised further; LIBERO frames are rotated by 180 degrees
-      (``rotate_180=True``), the convention used by common LIBERO pipelines.
+      (``rotate_180=True``), the convention used by common LIBERO pipelines. LIBERO renders the wrist
+      camera upside down as well, so the rotation applies to every view.
+    * With several cameras, all views must have the same stored frame shape, and I_t (like every
+      milestone frame) is the tuple of the views in ``camera_keys`` order.
 
 This file imports nothing from the VPA modules. ``python dataset.py`` runs the self-test
 (needs ``h5py``; writes a small synthetic LIBERO-format file to a temporary directory).
@@ -66,6 +76,7 @@ from torch.utils.data import DataLoader, Dataset
 __all__ = [
     "PRIMITIVE_NAMES",
     "DEFAULT_PROPRIO_KEYS",
+    "DEFAULT_CAMERA_KEY",
     "Episode",
     "instruction_from_filename",
     "action_chunk",
@@ -87,6 +98,9 @@ ACTION_OFFSET = 1
 
 # S_t = Concat(ee_pos, ee_ori, gripper_states, joint_states) -> d_s = 3 + 3 + 2 + 7 = 15 on LIBERO.
 DEFAULT_PROPRIO_KEYS: Tuple[str, ...] = ("ee_pos", "ee_ori", "gripper_states", "joint_states")
+
+# I_t of the single-camera setting (the third-person view).
+DEFAULT_CAMERA_KEY = "agentview_rgb"
 
 PathLike = Union[str, os.PathLike]
 PrimitiveSource = Literal["auto", "hdf5", "gripper"]
@@ -281,7 +295,9 @@ class LiberoHDF5Dataset(Dataset):
         horizon: chunk length H (= H_max).
         predictor_stride: nu >= 1; the JEPA target is I_{t+nu} (Sec. 3.3).
         image_size: (H_img, W_img) to resize to (bilinear, antialiased), or None for the native size.
-        camera_key: observation key of I_t (``agentview_rgb`` or ``eye_in_hand_rgb``).
+        camera_keys: observation key(s) of I_t, e.g. ``agentview_rgb`` (default) or
+            (``agentview_rgb``, ``eye_in_hand_rgb``); a string means one camera. The order is the
+            view order.
         proprio_keys: observation keys concatenated into S_t.
         rotate_180: rotate frames by 180 degrees (LIBERO renders them upside down).
         primitive_source: "hdf5" (``primitive_key`` in every demo), "gripper" (``gripper_phase_labels``)
@@ -297,10 +313,12 @@ class LiberoHDF5Dataset(Dataset):
         chunk_padding: "repeat" (pad past the episode end with the final action) or "drop".
         load_images: if False, samples carry no frames (used with a latent cache).
         episode_ids: global episode indices that contribute samples (default: all).
+        camera_key: single-camera spelling of ``camera_keys`` (kept for existing callers); give one
+            of the two, not both.
 
     Shapes of one sample (see the module docstring):
-        image, next_image ``[C, H_img, W_img]``; proprio ``[d_s]``; actions ``[H, d_a]``;
-        primitive, episode, timestep, task ``[]`` int64.
+        image, next_image ``[C, H_img, W_img]`` (one camera) or ``[V, C, H_img, W_img]`` (V cameras);
+        proprio ``[d_s]``; actions ``[H, d_a]``; primitive, episode, timestep, task ``[]`` int64.
     """
 
     def __init__(
@@ -310,7 +328,7 @@ class LiberoHDF5Dataset(Dataset):
         *,
         predictor_stride: int = 1,
         image_size: Optional[Tuple[int, int]] = None,
-        camera_key: str = "agentview_rgb",
+        camera_keys: Optional[Union[str, Sequence[str]]] = None,
         proprio_keys: Sequence[str] = DEFAULT_PROPRIO_KEYS,
         rotate_180: bool = True,
         primitive_source: PrimitiveSource = "auto",
@@ -323,6 +341,7 @@ class LiberoHDF5Dataset(Dataset):
         chunk_padding: Literal["repeat", "drop"] = "repeat",
         load_images: bool = True,
         episode_ids: Optional[Sequence[int]] = None,
+        camera_key: Optional[str] = None,
     ) -> None:
         super().__init__()
         if horizon < 1:
@@ -337,12 +356,19 @@ class LiberoHDF5Dataset(Dataset):
             raise ValueError(f"unknown chunk_padding {chunk_padding!r}")
         if not proprio_keys:
             raise ValueError("at least one proprioception key is required")
+        if camera_keys is not None and camera_key is not None:
+            raise ValueError("give camera_keys or camera_key, not both")
+        keys = camera_keys if camera_keys is not None else (camera_key or DEFAULT_CAMERA_KEY)
+        self.camera_keys: Tuple[str, ...] = (keys,) if isinstance(keys, str) else tuple(str(k) for k in keys)
+        if not self.camera_keys:
+            raise ValueError("at least one camera key is required")
+        if len(set(self.camera_keys)) != len(self.camera_keys):
+            raise ValueError(f"camera keys must be distinct, got {self.camera_keys}")
         self.horizon: int = int(horizon)
         self.predictor_stride: int = int(predictor_stride)
         self.image_size: Optional[Tuple[int, int]] = (
             None if image_size is None else (int(image_size[0]), int(image_size[1]))
         )
-        self.camera_key: str = camera_key
         self.proprio_keys: Tuple[str, ...] = tuple(proprio_keys)
         self.rotate_180: bool = bool(rotate_180)
         self.chunk_padding: str = chunk_padding
@@ -386,16 +412,18 @@ class LiberoHDF5Dataset(Dataset):
                         raise ValueError(f"{path}/{demo}: actions must be [T, d_a], got {actions.shape}")
                     length = actions.shape[0]
                     obs = g["obs"]
-                    if self.camera_key not in obs:
-                        raise KeyError(f"{path}/{demo}: missing obs/{self.camera_key}")
-                    cam = obs[self.camera_key]
-                    if cam.ndim != 4 or cam.shape[0] != length:
-                        raise ValueError(f"{path}/{demo}: obs/{self.camera_key} must be [T, H, W, C]")
-                    shape = (int(cam.shape[1]), int(cam.shape[2]), int(cam.shape[3]))
-                    if native_shape is None:
-                        native_shape = shape
-                    elif shape != native_shape:
-                        raise ValueError(f"{path}/{demo}: frame shape {shape} differs from {native_shape}")
+                    for key in self.camera_keys:  # every view: present, [T, H, W, C], one frame shape
+                        if key not in obs:
+                            raise KeyError(f"{path}/{demo}: missing obs/{key}")
+                        cam = obs[key]
+                        if cam.ndim != 4 or cam.shape[0] != length:
+                            raise ValueError(f"{path}/{demo}: obs/{key} must be [T, H, W, C]")
+                        shape = (int(cam.shape[1]), int(cam.shape[2]), int(cam.shape[3]))
+                        if native_shape is None:
+                            native_shape = shape
+                        elif shape != native_shape:
+                            raise ValueError(f"{path}/{demo}: frame shape {shape} of obs/{key} differs "
+                                             f"from {native_shape}")
                     parts = []
                     for key in self.proprio_keys:
                         if key not in obs:
@@ -553,11 +581,28 @@ class LiberoHDF5Dataset(Dataset):
 
     @property
     def image_shape(self) -> Tuple[int, int, int]:
-        """(C, H_img, W_img) of the frames this dataset returns."""
+        """(C, H_img, W_img) of one camera view as returned by this dataset."""
         h, w, c = self.native_image_shape
         if self.image_size is not None:
             h, w = self.image_size
         return (c, h, w)
+
+    @property
+    def num_views(self) -> int:
+        """V, the number of camera views per frame."""
+        return len(self.camera_keys)
+
+    @property
+    def camera_key(self) -> str:
+        """The camera of a single-camera dataset (kept for existing callers; use ``camera_keys``)."""
+        if len(self.camera_keys) != 1:
+            raise AttributeError(f"camera_key is defined for one camera only; this dataset has {self.camera_keys}")
+        return self.camera_keys[0]
+
+    @property
+    def frame_shape(self) -> Tuple[int, ...]:
+        """Shape of one frame I_t: ``(C, H_img, W_img)`` for one camera, ``(V, C, H_img, W_img)`` for V >= 2."""
+        return self.image_shape if self.num_views == 1 else (self.num_views, *self.image_shape)
 
     @property
     def num_frames(self) -> int:
@@ -603,9 +648,23 @@ class LiberoHDF5Dataset(Dataset):
             self._handles[path] = handle
         return handle
 
-    def _camera(self, episode: int) -> Any:
+    def _cameras(self, episode: int) -> List[Any]:
+        """The HDF5 datasets of the views of one episode, in ``camera_keys`` order."""
         ep = self.episodes[episode]
-        return self._file(ep.path)["data"][ep.demo]["obs"][self.camera_key]
+        obs = self._file(ep.path)["data"][ep.demo]["obs"]
+        return [obs[key] for key in self.camera_keys]
+
+    def _views(self, episode: int, index: Union[int, slice]) -> Tensor:
+        """Frames at ``index`` (one step or a slice of steps) of every view, through ``_to_tensor``.
+
+        One camera: ``[C, H_img, W_img]`` or ``[n, C, H_img, W_img]``, exactly the stored frames.
+        V >= 2 cameras: the views stacked in ``camera_keys`` order on a view axis,
+        ``[V, C, H_img, W_img]`` or ``[n, V, C, H_img, W_img]``.
+        """
+        cams = self._cameras(episode)
+        if len(cams) == 1:
+            return self._to_tensor(cams[0][index])
+        return torch.stack([self._to_tensor(cam[index]) for cam in cams], dim=-4)
 
     def _to_tensor(self, raw: np.ndarray) -> Tensor:
         """``[H, W, C]`` or ``[n, H, W, C]`` -> ``[C, H', W']`` or ``[n, C, H', W']`` float32."""
@@ -624,18 +683,17 @@ class LiberoHDF5Dataset(Dataset):
         return out[0] if single else out
 
     def frame(self, episode: int, t: int) -> Tensor:
-        """Frame I_t of one episode: ``[C, H_img, W_img]``."""
-        return self._to_tensor(self._camera(episode)[int(t)])
+        """Frame I_t of one episode: ``[*frame_shape]``, i.e. ``[C, H_img, W_img]`` or ``[V, C, H_img, W_img]``."""
+        return self._views(episode, int(t))
 
     def episode_frames(self, episode: int, start: int = 0, stop: Optional[int] = None) -> Tensor:
-        """Contiguous frames I_start .. I_{stop-1}: ``[n, C, H_img, W_img]``."""
+        """Contiguous frames I_start .. I_{stop-1}: ``[n, *frame_shape]``."""
         stop = self.episodes[episode].length if stop is None else int(stop)
-        return self._to_tensor(self._camera(episode)[int(start):stop])
+        return self._views(episode, slice(int(start), stop))
 
     def milestone_frames(self, episode: int) -> Tensor:
-        """Milestone goal frames I_g^(1..M) of one episode: ``[M, C, H_img, W_img]``."""
-        cam = self._camera(episode)
-        return torch.stack([self._to_tensor(cam[i]) for i in self.episodes[episode].milestones])
+        """Milestone goal frames I_g^(1..M) of one episode, same views as I_t: ``[M, *frame_shape]``."""
+        return torch.stack([self._views(episode, int(i)) for i in self.episodes[episode].milestones])
 
     def close(self) -> None:
         """Close the HDF5 handles opened by this process."""
@@ -683,7 +741,7 @@ class LiberoHDF5Dataset(Dataset):
 class LiberoFrameDataset(Dataset):
     """Blocks of consecutive frames covering every frame of the given episodes exactly once.
 
-    Item i is ``{"images": [n, C, H_img, W_img], "flat_index": [n] int64}`` where ``flat_index`` is
+    Item i is ``{"images": [n, *frame_shape], "flat_index": [n] int64}`` where ``flat_index`` is
     ``base.frame_offsets[episode] + t``. Use with ``get_frame_loader`` (each item is already a batch).
 
     Args:
@@ -714,7 +772,7 @@ class LiberoFrameDataset(Dataset):
         e, start, stop = self.blocks[index]
         offset = int(self.base.frame_offsets[e])
         return {
-            "images": self.base.episode_frames(e, start, stop),                       # [n, C, H, W]
+            "images": self.base.episode_frames(e, start, stop),                       # [n, *frame_shape]
             "flat_index": torch.arange(offset + start, offset + stop, dtype=torch.long),  # [n]
         }
 
@@ -761,7 +819,7 @@ def get_dataloader(
         multiprocessing_context: e.g. "spawn" or "fork" (default: the platform default).
 
     Returns:
-        ``DataLoader`` yielding dicts of batched tensors (``image [B, C, H_img, W_img]``,
+        ``DataLoader`` yielding dicts of batched tensors (``image [B, *frame_shape]``,
         ``actions [B, H, d_a]``, ``proprio [B, d_s]``, ...).
     """
     if batch_size < 2:
@@ -976,6 +1034,52 @@ def _self_test() -> None:
         assert ds_small.episode_frames(1, 2, 7).shape == (5, 3, 8, 8)
         ds_lat = LiberoHDF5Dataset(tmp, horizon=4, load_images=False, primitive_source="gripper")
         assert "image" not in ds_lat[0] and len(ds_lat) == sum(t - 1 for t in lengths)
+
+        # several cameras: views stacked in camera_keys order, each view bit-identical to the
+        # one-camera dataset of that key; everything that is not a frame is unchanged
+        keys2 = ("agentview_rgb", "eye_in_hand_rgb")
+        ds2 = LiberoHDF5Dataset(tmp, horizon=4, predictor_stride=2, camera_keys=keys2, primitive_source="gripper")
+        ds_eye = LiberoHDF5Dataset(tmp, horizon=4, predictor_stride=2, camera_keys="eye_in_hand_rgb",
+                                   primitive_source="gripper")
+        assert ds.camera_keys == ("agentview_rgb",) and ds.num_views == 1 and ds.frame_shape == (3, 16, 16)
+        assert ds2.camera_keys == keys2 and ds2.num_views == 2 and ds2.frame_shape == (2, 3, 16, 16)
+        assert ds2.image_shape == (3, 16, 16) and ds_eye.frame_shape == (3, 16, 16) and len(ds2) == len(ds)
+        for index in (0, 7, len(ds) - 1):
+            one, two, eye = ds[index], ds2[index], ds_eye[index]
+            assert two["image"].shape == (2, 3, 16, 16) and two["next_image"].shape == (2, 3, 16, 16)
+            assert torch.equal(two["image"][0], one["image"]) and torch.equal(two["image"][1], eye["image"])
+            assert torch.equal(two["next_image"][0], one["next_image"])
+            assert torch.equal(two["next_image"][1], eye["next_image"])
+            for key in ("proprio", "actions", "primitive", "episode", "timestep", "task"):
+                assert torch.equal(two[key], one[key]), key
+        with h5py.File(file_a, "r") as fa:      # the wrist view against the raw file (demo_1 = episode 1)
+            raw_eye = fa["data"]["demo_1"]["obs"]["eye_in_hand_rgb"][4]
+        ref_eye = np.stack([[[raw_eye[15 - r, 15 - c, ch] / 255.0 for c in range(16)] for r in range(16)]
+                            for ch in range(3)])
+        assert np.allclose(ds2.frame(1, 4)[1].numpy(), ref_eye, atol=1e-7)
+        block2 = ds2.episode_frames(1, 2, 7)
+        assert block2.shape == (5, 2, 3, 16, 16)
+        assert torch.equal(block2[:, 0], ds.episode_frames(1, 2, 7))
+        assert torch.equal(block2[:, 1], ds_eye.episode_frames(1, 2, 7))
+        assert ds2.milestone_frames(0).shape == (1, 2, 3, 16, 16)
+        assert torch.equal(ds2.milestone_frames(0)[:, 0], ds.milestone_frames(0))
+        assert torch.equal(ds2.milestone_frames(0)[:, 1], ds_eye.milestone_frames(0))
+        assert LiberoFrameDataset(ds2, block_size=5)[0]["images"].shape == (5, 2, 3, 16, 16)
+        ds2_small = LiberoHDF5Dataset(tmp, horizon=4, camera_keys=keys2, image_size=(8, 8), primitive_source="gripper")
+        assert ds2_small[0]["image"].shape == (2, 3, 8, 8) and ds2_small.frame_shape == (2, 3, 8, 8)
+        ds2_rev = LiberoHDF5Dataset(tmp, horizon=4, camera_keys=keys2[::-1], primitive_source="gripper")
+        assert torch.equal(ds2_rev.frame(0, 3), ds2.frame(0, 3).flip(0))     # camera_keys order = view order
+        assert LiberoHDF5Dataset(tmp, horizon=4, camera_key="eye_in_hand_rgb",
+                                 primitive_source="gripper").camera_keys == ("eye_in_hand_rgb",)  # old keyword
+        _expect(KeyError, lambda: LiberoHDF5Dataset(tmp, horizon=4, camera_keys=("agentview_rgb", "nope")))
+        _expect(ValueError, lambda: LiberoHDF5Dataset(tmp, horizon=4, camera_keys=("agentview_rgb",) * 2))
+        _expect(ValueError, lambda: LiberoHDF5Dataset(tmp, horizon=4, camera_keys=()))
+        _expect(ValueError, lambda: LiberoHDF5Dataset(tmp, horizon=4, camera_keys="agentview_rgb",
+                                                      camera_key="agentview_rgb"))
+        batch2 = next(iter(get_dataloader(ds2, batch_size=4, num_workers=0, seed=7, pin_memory=False)))
+        assert batch2["image"].shape == (4, 2, 3, 16, 16) and batch2["next_image"].shape == (4, 2, 3, 16, 16)
+        for d in (ds2, ds_eye, ds2_small, ds2_rev):
+            d.close()
 
         # episode split: disjoint, stratified, covering
         train, val = ds.split_episodes(0.4, seed=0)
