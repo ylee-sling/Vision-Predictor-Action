@@ -9,8 +9,8 @@ training objectives consume:
     image       I_t        ``[C, H_img, W_img]`` float32 in [0, 1]  E_psi input (Eqs. 1, 7)
     next_image  I_{t+nu}   ``[C, H_img, W_img]`` target frame of Eq. 11 (stride nu, Sec. 3.3)
     proprio     S_t        ``[d_s]``   raw proprioception (Eq. 1; standardised later, Sec. 4.5)
-    actions     A_t        ``[H, d_a]`` the next H commands after I_t (Eq. 3; regression target of Eq. 14)
-    primitive   u_t        ``[]`` int64 primitive label of the next command (Eq. 10, Sec. 4.2, Fig. 3)
+    actions     A_t        ``[H, d_a]`` (a_t, ..., a_{t+H-1}) (Eq. 3; regression target of Eq. 14)
+    primitive   u_t        ``[]`` int64 demonstration primitive label (Eq. 10, Sec. 4.2, Fig. 3)
     episode, timestep, task ``[]`` int64 bookkeeping (latent-cache and c_text lookups in train.py)
 
 LIBERO file layout (written by LIBERO's ``create_dataset.py``):
@@ -20,11 +20,6 @@ LIBERO file layout (written by LIBERO's ``create_dataset.py``):
     data/demo_<i>/obs/eye_in_hand_rgb   ``[T, 128, 128, 3]`` uint8, rendered upside down
     data/demo_<i>/obs/ee_pos [T, 3], ee_ori [T, 3], ee_states [T, 6], gripper_states [T, 2],
                      joint_states [T, 7]
-
-Frame / action alignment. ``create_dataset.py`` steps the simulator with ``actions[k]`` and then
-records the resulting observation as frame k, so frame k shows the state *after* ``actions[k]``.
-The command to issue from frame k is therefore ``actions[k + 1]``. A sample at frame t uses
-A_t = (actions[t+1], ..., actions[t+H]) and the label of ``actions[t+1]`` (``ACTION_OFFSET = 1``).
 
 Two inputs required by the paper are not part of LIBERO. The paper is silent on how they are
 produced, so this module reads them from the file when present and otherwise uses an explicit,
@@ -37,8 +32,7 @@ documented stand-in:
 Decisions where the paper is silent (do not change silently):
     * Chunks that run past the end of a demonstration repeat its final action
       (``chunk_padding="repeat"``); ``"drop"`` keeps only fully observed chunks.
-    * Samples are restricted to t <= T - 1 - nu, so every sample has a real target frame I_{t+nu};
-      since nu >= 1, the first command actions[t + 1] also always exists.
+    * Samples are restricted to t <= T - 1 - nu, so every sample has a real target frame I_{t+nu}.
     * Frames are scaled to [0, 1] and not normalised further; LIBERO frames are rotated by 180 degrees
       (``rotate_180=True``), the convention used by common LIBERO pipelines.
 
@@ -81,9 +75,6 @@ __all__ = [
 # Labels produced by ``gripper_phase_labels`` (a stand-in; the paper does not define U).
 REACH, GRASP, CARRY, RELEASE = 0, 1, 2, 3
 PRIMITIVE_NAMES: Tuple[str, ...] = ("reach", "grasp", "carry", "release")
-
-# Frame k of a LIBERO demonstration is recorded after actions[k] (see the module docstring).
-ACTION_OFFSET = 1
 
 # S_t = Concat(ee_pos, ee_ori, gripper_states, joint_states) -> d_s = 3 + 3 + 2 + 7 = 15 on LIBERO.
 DEFAULT_PROPRIO_KEYS: Tuple[str, ...] = ("ee_pos", "ee_ori", "gripper_states", "joint_states")
@@ -497,7 +488,7 @@ class LiberoHDF5Dataset(Dataset):
             length = self.episodes[e].length
             last = length - 1 - self.predictor_stride            # I_{t+nu} must exist
             if self.chunk_padding == "drop":
-                last = min(last, length - ACTION_OFFSET - self.horizon)  # actions[t+H] must exist
+                last = min(last, length - self.horizon)          # a_{t+H-1} must exist
             if last >= 0:
                 t = np.arange(last + 1, dtype=np.int64)
                 rows.append(np.stack([np.full_like(t, e), t], axis=1))
@@ -664,9 +655,8 @@ class LiberoHDF5Dataset(Dataset):
         e, t = self.sample_index(index)
         item: Dict[str, Tensor] = {
             "proprio": torch.from_numpy(self._proprio[e][t].copy()),                          # [d_s]
-            # frame t shows the state after actions[t]; the commands to learn start at actions[t + 1]
-            "actions": torch.from_numpy(action_chunk(self._actions[e], t + ACTION_OFFSET, self.horizon)),  # [H, d_a]
-            "primitive": torch.tensor(int(self._labels[e][t + ACTION_OFFSET]), dtype=torch.long),         # []
+            "actions": torch.from_numpy(action_chunk(self._actions[e], t, self.horizon)),      # [H, d_a]
+            "primitive": torch.tensor(int(self._labels[e][t]), dtype=torch.long),              # []
             "episode": torch.tensor(e, dtype=torch.long),
             "timestep": torch.tensor(t, dtype=torch.long),
             "task": torch.tensor(self.episodes[e].task, dtype=torch.long),
@@ -951,9 +941,9 @@ def _self_test() -> None:
                 ref_s = np.concatenate([g["obs"][k][t] for k in DEFAULT_PROPRIO_KEYS]).astype(np.float32)
                 assert np.array_equal(item["proprio"].numpy(), ref_s)
                 a = g["actions"][()]
-                ref_a = np.stack([a[min(t + 1 + h, a.shape[0] - 1)] for h in range(4)]).astype(np.float32)
+                ref_a = np.stack([a[min(t + h, a.shape[0] - 1)] for h in range(4)]).astype(np.float32)
                 assert np.array_equal(item["actions"].numpy(), ref_a) and item["actions"].shape == (4, 7)
-                assert int(item["primitive"]) == _ref_phase_labels(a[:, -1], 10)[t + 1]
+                assert int(item["primitive"]) == _ref_phase_labels(a[:, -1], 10)[t]
                 assert int(item["task"]) == ds.episodes[e].task and int(item["episode"]) == e
                 assert item["image"].dtype == torch.float32 and item["primitive"].dtype == torch.long
 
@@ -967,7 +957,7 @@ def _self_test() -> None:
         # drop padding, resize, no images, gripper milestones
         ds_drop = LiberoHDF5Dataset(tmp, horizon=4, predictor_stride=2, chunk_padding="drop",
                                     milestone_source="gripper", primitive_source="gripper")
-        assert len(ds_drop) == sum(min(t - 3, t - 5) + 1 for t in lengths)   # t <= T-1-nu and t+H <= T-1
+        assert len(ds_drop) == sum(min(t - 3, t - 4) + 1 for t in lengths)
         assert all(e.milestones[-1] == e.length - 1 for e in ds_drop.episodes)
         ds_small = LiberoHDF5Dataset(tmp, horizon=4, image_size=(8, 8), load_images=True,
                                      primitive_source="gripper")
@@ -1002,7 +992,7 @@ def _self_test() -> None:
         ds_c = LiberoHDF5Dataset(file_c, horizon=3)
         assert ds_c.primitive_source == "hdf5" and ds_c.num_primitives == 6
         assert ds_c.milestone_source == "hdf5" and [e.milestones for e in ds_c.episodes] == [(3, 9), (7,)]
-        assert [int(ds_c[i]["primitive"]) for i in range(len(ds_c))] == lab_c[0][1:10].tolist() + lab_c[1][1:8].tolist()
+        assert [int(ds_c[i]["primitive"]) for i in range(len(ds_c))] == lab_c[0][:9].tolist() + lab_c[1][:7].tolist()
         _expect(KeyError, lambda: LiberoHDF5Dataset(file_a, horizon=3, primitive_source="hdf5"))
         _expect(ValueError, lambda: LiberoHDF5Dataset([file_a, file_c], horizon=3))  # mixed annotation
 

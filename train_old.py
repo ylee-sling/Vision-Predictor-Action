@@ -44,14 +44,11 @@ Decisions where the paper is silent (do not change silently):
     * sigma_S entries below 1e-6 (constant proprioception channels) are replaced by 1.
     * L_solver + w * L_select is minimised with one optimiser; the two losses share no parameters,
       and gradient clipping is applied per module, so they are optimised independently.
-    * E_psi starts from random weights unless ``--init-encoder`` is given; then its first blocks are
-      initialised from DINOv2 (``pretrained_encoder.py``) and stage 1 trains it with Eq. 11 as usual.
 
 Usage:
     python train.py --data /path/to/libero_10 --out runs/libero10
     python train.py --data ... --out ... --stage policy --init-from runs/libero10/jepa_final.pt
     python train.py --data ... --out ... --resume runs/libero10/jepa_step0010000.pt
-    python train.py --data ... --out runs/libero10_dino --init-encoder dinov2-small --encoder-lr 1e-4
     python train.py --self-test        # offline, CPU, synthetic LIBERO-format data (needs h5py)
 
 The final checkpoint loads straight into the inference pipeline with ``load_pipeline(path)``.
@@ -72,7 +69,7 @@ import sys
 import tempfile
 import time
 from collections import defaultdict
-from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -197,28 +194,11 @@ def make_optimizer(
     weight_decay: float,
     betas: Tuple[float, float],
     device: torch.device,
-    lr_override: Optional[Callable[[str], Optional[float]]] = None,
 ) -> torch.optim.AdamW:
-    """AdamW with weight decay on matrices only.
-
-    ``lr_override(name)`` may return a different learning rate for a parameter (None: ``lr``). Groups are
-    ordered by first appearance of each learning rate, decay before no-decay; without an override this is
-    exactly the two groups [decay, no-decay] of earlier versions, so old optimiser states still load.
-    """
-    def lr_of(name: str) -> float:
-        value = None if lr_override is None else lr_override(name)
-        return lr if value is None else float(value)
-
-    rates: List[float] = []
-    for n, p in named_params:
-        if p.requires_grad and lr_of(n) not in rates:
-            rates.append(lr_of(n))
-    groups = []
-    for rate in rates:
-        decay = [p for n, p in named_params if p.requires_grad and lr_of(n) == rate and not _no_weight_decay(n, p)]
-        no_decay = [p for n, p in named_params if p.requires_grad and lr_of(n) == rate and _no_weight_decay(n, p)]
-        groups += [{"params": ps, "weight_decay": wd, "lr": rate}
-                   for ps, wd in ((decay, weight_decay), (no_decay, 0.0)) if ps]
+    """AdamW with weight decay on matrices only."""
+    decay = [p for n, p in named_params if p.requires_grad and not _no_weight_decay(n, p)]
+    no_decay = [p for n, p in named_params if p.requires_grad and _no_weight_decay(n, p)]
+    groups = [{"params": ps, "weight_decay": wd} for ps, wd in ((decay, weight_decay), (no_decay, 0.0)) if ps]
     return torch.optim.AdamW(groups, lr=lr, betas=betas, fused=device.type == "cuda")
 
 
@@ -271,15 +251,6 @@ def build_text_encoder(kind: str, model_name: str, toy_projection_dim: int = 12)
     raise ValueError(f"unknown text encoder {kind!r}")
 
 
-def init_vision_encoder(encoder: nn.Module, name_or_path: str) -> Dict[str, Any]:
-    """Initialise E_psi from DINOv2 (``pretrained_encoder.py``, imported only when this option is used)."""
-    try:
-        from .pretrained_encoder import init_vision_encoder as _init
-    except ImportError:
-        from pretrained_encoder import init_vision_encoder as _init
-    return _init(encoder, name_or_path)
-
-
 _TUPLE_FIELDS = ("image_size", "selector_hidden")
 
 
@@ -300,7 +271,6 @@ def resolve_overrides(args: argparse.Namespace) -> Dict[str, Any]:
         "predictor_stride": args.predictor_stride,
         "num_primitives": args.num_primitives,
         "latent_dim": args.latent_dim,
-        "patch_size": args.patch_size,
         "clip_model_name": args.clip_model,
     }
     overrides.update({k: v for k, v in cli.items() if v is not None})
@@ -461,8 +431,6 @@ class JEPATrainer:
         lr, weight_decay, betas, warmup_steps, total_steps, min_lr_ratio, grad_clip: optimiser settings.
         amp: "none" or "bf16" (CUDA only; the loss is always evaluated in float32).
         device: training device.
-        encoder_lr: optional learning rate for E_psi's body (every encoder parameter except the latent
-            head), e.g. lower than ``lr`` when E_psi starts from pre-trained weights. None: ``lr``.
     """
 
     def __init__(
@@ -480,7 +448,6 @@ class JEPATrainer:
         grad_clip: float,
         amp: str,
         device: torch.device,
-        encoder_lr: Optional[float] = None,
     ) -> None:
         pipe.check_vicreg_loss(vicreg)   # Eq. 9b and Eq. 18 share eps
         if bool(pipe.tracker.frozen):
@@ -491,14 +458,7 @@ class JEPATrainer:
         named = (list(pipe.vision_encoder.named_parameters(prefix="vision_encoder"))
                  + list(pipe.predictor.named_parameters(prefix="predictor")))
         self.params: List[Tensor] = [p for _, p in named]
-
-        def body_lr(name: str) -> Optional[float]:
-            is_body = name.startswith("vision_encoder.") and not name.startswith("vision_encoder.head.")
-            return encoder_lr if is_body else None
-
-        self.encoder_lr = encoder_lr
-        self.optimizer = make_optimizer(named, lr, weight_decay, betas, device,
-                                        lr_override=None if encoder_lr is None else body_lr)
+        self.optimizer = make_optimizer(named, lr, weight_decay, betas, device)
         self.scheduler = make_scheduler(self.optimizer, warmup_steps, total_steps, min_lr_ratio)
         self.step: int = 0
 
@@ -540,7 +500,7 @@ class JEPATrainer:
         z_detached = z_t.detach().float()
         gamma_n = self.pipe.tracker.update_variance_margin(z_detached)        # Eq. 9b with Z^(n)
         self.step += 1
-        record = {
+        return {
             "loss": float(loss.detach()),
             "invariance": float(terms["invariance"]),
             "variance": float(terms["variance"]),
@@ -549,11 +509,8 @@ class JEPATrainer:
             "tau": self.pipe.tracker.threshold,                               # tau_n, Eq. 9c
             "latent_std": float(z_detached.std(dim=0).mean()),
             "grad_norm": grad_norm,
-            "lr": self.optimizer.param_groups[-1]["lr"],                       # groups at the base rate come last
+            "lr": self.optimizer.param_groups[0]["lr"],
         }
-        if self.encoder_lr is not None:
-            record["lr_encoder"] = self.optimizer.param_groups[0]["lr"]
-        return record
 
     @torch.no_grad()
     def evaluate(self, loader: Any, max_batches: int) -> Dict[str, float]:
@@ -997,7 +954,7 @@ def train_jepa(
     trainer = JEPATrainer(
         pipe, vicreg, momentum, lr=args.jepa_lr, weight_decay=args.weight_decay, betas=tuple(args.betas),
         warmup_steps=args.warmup_steps, total_steps=args.jepa_steps, min_lr_ratio=args.min_lr_ratio,
-        grad_clip=args.grad_clip, amp=args.amp, device=device, encoder_lr=args.encoder_lr,
+        grad_clip=args.grad_clip, amp=args.amp, device=device,
     )
     if resume is not None and resume.get("trainer") is not None:
         trainer.load_state_dict(resume["trainer"])
@@ -1100,12 +1057,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     model = p.add_argument_group("model (VPAConfig overrides)")
     model.add_argument("--config-json", help="JSON object of VPAConfig fields")
-    model.add_argument("--image-size", type=int,
-                       help="square frame size (default: the data's native size; 112 with --init-encoder)")
-    model.add_argument("--patch-size", type=int, help="ViT patch size (default 16; 14 with --init-encoder)")
-    model.add_argument("--init-encoder",
-                       help="initialise E_psi from pre-trained DINOv2: 'dinov2-small' (ViT-S/14, matches the default "
-                            "width 384 / 6 heads), a Hugging Face DINOv2 id or a local directory; new runs only")
+    model.add_argument("--image-size", type=int, help="square frame size (default: the data's native size)")
     model.add_argument("--latent-dim", type=int)
     model.add_argument("--horizon", type=int, help="H = H_max")
     model.add_argument("--min-horizon", type=int, help="H_min")
@@ -1122,9 +1074,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     opt.add_argument("--batch-size", type=int, default=64, help="B >= 2")
     opt.add_argument("--policy-batch-size", type=int, help="default: --batch-size")
     opt.add_argument("--jepa-lr", type=float, default=3e-4)
-    opt.add_argument("--encoder-lr", type=float,
-                     help="stage-1 learning rate of E_psi except its latent head (default: --jepa-lr); "
-                          "e.g. 1e-4 with --init-encoder")
     opt.add_argument("--policy-lr", type=float, default=3e-4)
     opt.add_argument("--weight-decay", type=float, default=0.05)
     opt.add_argument("--betas", type=float, nargs=2, default=(0.9, 0.95))
@@ -1178,11 +1127,6 @@ def run(args: argparse.Namespace) -> VPAInferencePipeline:
 
     # ---- data and configuration (a checkpoint's own configuration wins over the flags)
     overrides = dict(ckpt["config"]) if ckpt is not None else resolve_overrides(args)
-    if args.init_encoder and ckpt is not None:
-        logger.warning("--init-encoder is ignored: the encoder weights come from %s", ckpt_path)
-    if args.init_encoder and ckpt is None:
-        overrides.setdefault("patch_size", 14)          # DINOv2 patch size
-        overrides.setdefault("image_size", (112, 112))  # 8 x 8 patches, as many tokens as 128 / 16
     horizon = int(overrides.get("horizon", VPAConfig.horizon))
     stride = int(overrides.get("predictor_stride", VPAConfig.predictor_stride))
     ds = LiberoHDF5Dataset(
@@ -1211,15 +1155,9 @@ def run(args: argparse.Namespace) -> VPAInferencePipeline:
     text_kind = text_info["kind"]
     text_encoder = build_text_encoder(text_kind, cfg.clip_model_name, text_info["embed_dim"])
     pipe = VPAInferencePipeline.from_config(cfg, text_encoder=text_encoder)
-    encoder_init: Optional[Dict[str, Any]] = None
     if ckpt is not None:
         load_model_state(pipe, ckpt["model"], text_kind)
-        encoder_init = ckpt["extra"].get("encoder_init")
         logger.info("loaded %s (stage %s, step %d)", ckpt_path, ckpt["stage"], ckpt["step"])
-    elif args.init_encoder:
-        encoder_init = init_vision_encoder(pipe.vision_encoder, args.init_encoder)  # before E_psi_bar is copied
-        logger.info("E_psi initialised from %s: first %d of %d blocks, patch grid %s", encoder_init["source"],
-                    encoder_init["blocks_used"], encoder_init["blocks_available"], encoder_init["patch_grid"])
     pipe.to(device)
     extra = {
         "data": {
@@ -1230,7 +1168,6 @@ def run(args: argparse.Namespace) -> VPAInferencePipeline:
             "val_episodes": val_ds.episode_ids.tolist(),
         },
         "text_encoder": {"kind": text_kind, "name": cfg.clip_model_name, "embed_dim": text_encoder.embed_dim},
-        "encoder_init": encoder_init,
         "args": _json_safe(vars(args)),
     }
     with open(os.path.join(args.out, "config.json"), "w", encoding="utf-8") as f:
@@ -1534,28 +1471,6 @@ def _self_test() -> None:
                                                      "--resume", os.path.join(res_dir, "jepa_step0000001.pt")]))
         final = load_checkpoint(os.path.join(res_dir, "jepa_final.pt"))
         assert final["step"] == 4 and bool(final["model"]["tracker.frozen"])
-        assert len(first["trainer"]["optimizer"]["param_groups"]) == 2      # no --encoder-lr: groups as before
-
-        # ---- pre-trained E_psi initialisation and --encoder-lr (offline: a random DINOv2 saved to disk)
-        from transformers import Dinov2Config, Dinov2Model
-
-        dino_dir = os.path.join(tmp, "dino")
-        Dinov2Model(Dinov2Config(hidden_size=32, num_hidden_layers=3, num_attention_heads=4, mlp_ratio=4,
-                                 patch_size=8, image_size=32)).save_pretrained(dino_dir)
-        dino_run = os.path.join(tmp, "dino_run")
-        run(_test_args(data_dir, dino_run, cfg_path, ["--stage", "jepa", "--jepa-steps", "1",
-                                                      "--init-encoder", dino_dir, "--encoder-lr", "1e-4"]))
-        dino_ckpt = load_checkpoint(os.path.join(dino_run, "jepa_final.pt"))
-        record = dino_ckpt["extra"]["encoder_init"]
-        assert record["source"] == dino_dir and record["blocks_used"] == 2 and record["patch_grid"] == [2, 2]
-        groups = dino_ckpt["trainer"]["optimizer"]["param_groups"]
-        assert sorted({g["initial_lr"] for g in groups}) == [1e-4, 1e-3] and len(groups) == 4
-        fresh = VPAInferencePipeline.from_config(VPAConfig(**dino_ckpt["config"]),
-                                                 text_encoder=build_text_encoder("toy", "unused")).vision_encoder
-        before = fresh.cls_token.detach().clone()
-        init_vision_encoder(fresh, dino_dir)
-        reference = Dinov2Model.from_pretrained(dino_dir).embeddings.cls_token.detach()
-        assert torch.equal(fresh.cls_token.detach(), reference) and not torch.equal(before, reference)
         _close_logging()
     print("train.py self-test passed")
 

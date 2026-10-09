@@ -16,9 +16,27 @@ __pycache__/
 .vscode/
 .DS_Store
 
-# Benchmark output (bench_latency.py prints to stdout; redirected results go here)
+# Benchmark output
 bench_results/
 bench_*.txt
 bench_*.log
 bench_*.csv
 bench_*.json
+
+# --------------------------------------------------
+# Added for VPA Repository (Datasets, Checkpoints, Logs)
+# --------------------------------------------------
+# Datasets (HDF5 files)
+data/
+*.hdf5
+
+# Model Checkpoints / Weights
+runs/
+*.pt
+*.pth
+
+# Evaluation Outputs & Logs
+eval_results/
+MUJOCO_LOG.TXT
+*.log
+EOF
