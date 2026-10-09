@@ -235,6 +235,19 @@ python eval.py --checkpoint runs/libero10_2cam/policy_final.pt --suite-name libe
     --out eval_results/libero10_2cam
 ```
 
+**Sanity checks.**
+
+```bash
+python scripts/check_alignment.py data/libero_10      # is frame k recorded after actions[k]? (expects ACTION_OFFSET = 1)
+python eval.py --checkpoint ... --blind-cameras agentview_rgb    # black out one view of I_t (or: all)
+python train.py --data data/libero_10/<task>_demo.hdf5 --demos-per-task 1 --out runs/overfit ...   # one demo
+python eval.py --checkpoint runs/overfit/policy_final.pt --task-ids <id> --milestone-demo 0 --init-from-demo
+```
+
+`--blind-cameras` measures how much the policy relies on each camera (milestone frames stay unchanged).
+`--demos-per-task 1` trains on a single demonstration; `--init-from-demo` starts every trial from that
+demonstration's own first state, so a policy that memorised it should succeed nearly every time.
+
 **Camera ablation.** `scripts/camera_ablation.sh` trains and evaluates both settings for several seeds with
 otherwise identical settings (50 episodes per task, one evaluation seed), times both encoders with
 `bench_latency.py`, and writes a summary table with `scripts/summarize_ablation.py` (success mean ± std over

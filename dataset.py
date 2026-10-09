@@ -912,6 +912,11 @@ def _write_synthetic_libero(
             obs.create_dataset("ee_ori", data=rng.normal(size=(length, 3)))
             obs.create_dataset("gripper_states", data=rng.normal(size=(length, 2)))
             obs.create_dataset("joint_states", data=rng.normal(size=(length, 7)))
+            # flattened simulator states as LIBERO stores them; deterministic (no RNG draw, so the frames and
+            # arrays above stay the same as before). Column 0 is a fake "time" the self-tests' fake env reads.
+            states = np.zeros((length, 5), dtype=np.float64)
+            states[:, 0] = np.arange(length) + 3
+            g.create_dataset("states", data=states)
             if primitive_labels is not None:
                 g.create_dataset("primitive_labels", data=np.asarray(primitive_labels[i], dtype=np.int64))
             if milestones is not None:
