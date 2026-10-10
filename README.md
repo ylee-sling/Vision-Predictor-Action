@@ -41,11 +41,11 @@ A copy of the preprint is included at [`docs/preprint_261008.pdf`](docs/preprint
 ## Status
 
 > [!IMPORTANT]
-> **This is an untrained research prototype with equation-level verification.**
-> Every network has random weights. The self-tests check each equation of the paper against independent reference
-> computations, but **no task-level results are claimed**: there are no trained models, no success rates and no
-> comparisons with other methods. The empirical evaluation described in Section 6 of the paper is future work, which
-> matches the paper's own statement that no empirical results are reported.
+> **A research prototype with equation-level verification and first, preliminary LIBERO-10 results.**
+> The self-tests check each equation of the paper against independent reference computations. Trained checkpoints
+> and success rates on LIBERO-10 are reported below under [Results](#results-on-libero-10-preliminary): one training
+> run per setting and 20 trials per task, so they are preliminary (±7 points) and not yet a comparison with other
+> methods. The Section 6 evaluation of the paper (Isaac Sim, ManiSkill3) is future work.
 
 ## Architecture
 
@@ -259,6 +259,62 @@ DATA=/path/to/LIBERO/datasets/libero_10 bash scripts/camera_ablation.sh
 DATA=... TRAIN_ARGS="--init-encoder dinov2-small --encoder-lr 1e-4" bash scripts/camera_ablation.sh
 ```
 
+## Results on LIBERO-10 (preliminary)
+
+> [!NOTE]
+> **Preliminary:** one training run per setting (seed 0) and 20 trials per task, i.e. 200 episodes per number;
+> the 95% interval is about ±7 points. All runs use the `train.py` defaults (randomly initialised ViT encoder,
+> 128×128 frames, 50k + 50k steps, batch 64, K = 2, H = 16) and `eval.py` defaults (600 steps, LIBERO's fixed
+> initial states). Numbers: [`results/libero10_pilot.json`](results/libero10_pilot.json). Checkpoints:
+> [huggingface.co/ylee-sling/vpa-libero10](https://huggingface.co/ylee-sling/vpa-libero10).
+
+**One camera vs two cameras.** Adding the wrist camera (`eye_in_hand_rgb`) to the third-person view
+(`agentview_rgb`) raises the success rate from **10.5% to 40.0%**; the two-camera model is at least as good on every task.
+
+| Task | One camera | Two cameras |
+|---|---|---|
+| 0 · alphabet soup + tomato sauce → basket | 0% | 10% |
+| 1 · cream cheese + butter → basket | 0% | 45% |
+| 2 · turn on stove, moka pot on it | 30% | 40% |
+| 3 · black bowl → bottom drawer, close it | 35% | 55% |
+| 4 · white mug → left plate, yellow-white mug → right plate | 0% | 40% |
+| 5 · book → back compartment of caddy | 20% | 50% |
+| 6 · white mug on plate, pudding right of plate | 0% | 15% |
+| 7 · alphabet soup + cream cheese → basket | 0% | 50% |
+| 8 · both moka pots → stove | 0% | 45% |
+| 9 · yellow-white mug → microwave, close it | 20% | 50% |
+| **All (200 episodes)** | **10.5%** [7.0, 15.5] | **40.0%** [33.5, 46.9] |
+
+Same trial, same start state, one camera (left) vs two cameras (right; third-person and wrist view side by side):
+
+| Task | One camera | Two cameras |
+|---|---|---|
+| 5 · book → caddy | ![](docs/media/task05_trial01_1cam.gif) | ![](docs/media/task05_trial01_2cam.gif) |
+| 7 · soup + cream cheese → basket | ![](docs/media/task07_trial00_1cam.gif) | ![](docs/media/task07_trial00_2cam.gif) |
+| 8 · both moka pots → stove | ![](docs/media/task08_trial02_1cam.gif) | ![](docs/media/task08_trial02_2cam.gif) |
+
+GIFs at 2× speed. All 60 evaluation videos (3 trials × 10 tasks × 2 models) are attached to the
+[GitHub release](https://github.com/ylee-sling/Vision-Predictor-Action/releases).
+
+**Execution horizon (two cameras).** Executing more of each 16-action chunk before replanning works better:
+
+| Actions executed per decision | 2 | 4 | 8 | Eq. 15 with tuned β = 40.4 (mostly 4–6) | **Eq. 15, β = 1 (H_t = 15)** |
+|---|---|---|---|---|---|
+| Success | 16.0% | 26.0% | 33.5% | 30.5% | **40.0%** |
+
+A likely reason is that every new chunk starts from fresh flow noise, so frequent replanning switches between
+different ways of doing the same motion.
+
+**Training length (two cameras).** The checkpoints at 40k, 45k and 50k stage-2 steps reach 32.5%, 36.0% and 40.0%:
+the model was still improving when training stopped.
+
+**Blindfold test (two cameras, `eval.py --blind-cameras`).** Blacking out the third-person view at every decision
+step gives 0% (0/200). A black frame is also an input the model never saw in training, so this shows that the
+policy depends on that view rather than measuring its information content cleanly.
+
+**Data alignment.** `scripts/check_alignment.py` confirms on the LIBERO-10 files that frame t is recorded after
+`actions[t]`, so the training pairs (I_t, S_t) with A_t = `actions[t+1 … t+H]` are aligned correctly.
+
 ## Testing
 
 Each module has a self-test, run on CPU, deterministic (fixed seeds) and offline (an offline stand-in replaces CLIP).
@@ -429,9 +485,8 @@ The paper fixes the equations but leaves some details open. This implementation 
 
 ## Not yet implemented / roadmap
 
-- **Trained models and results.** LIBERO data loading, the two-stage training loop and closed-loop LIBERO
-  evaluation exist (`dataset.py`, `train.py`, `eval.py`, one or two cameras), but no trained checkpoints or
-  success rates are published yet.
+- **Full LIBERO results.** The [preliminary results](#results-on-libero-10-preliminary) use one seed and 20 trials per
+  task; the standard protocol (several seeds, 50 trials per task, all LIBERO suites) and comparisons are still to do.
 - **Section 6 evaluation** in simulation (NVIDIA Isaac Sim, ManiSkill3): task success, latency on target hardware,
   encoder-regularity constants and phase-onset residuals.
 - **Per-milestone time-out** for detecting stalled milestones (deferred in Secs. 4.2 and 6 of the paper).
@@ -457,7 +512,11 @@ vpa-pytorch/
 │   └── dump_reference_outputs.py  # deterministic outputs of one source tree (used by the regression test)
 ├── scripts/
 │   ├── camera_ablation.sh         # one vs two cameras: train, evaluate, benchmark, summarize
-│   └── summarize_ablation.py      # success table from eval_metrics.json files
+│   ├── summarize_ablation.py      # success table from eval_metrics.json files
+│   ├── check_alignment.py         # is frame k recorded after actions[k]? (LIBERO files)
+│   ├── make_media.py              # README GIFs and a video archive from eval.py --save-video runs
+│   └── export_checkpoint.py       # slim checkpoint + safetensors for sharing (Hugging Face)
+├── results/libero10_pilot.json    # preliminary LIBERO-10 success rates
 ├── requirements.txt      # torch, transformers (pinned)
 ├── requirements-dev.txt  # + ruff
 ├── CLAUDE.md             # development rules and design decisions
@@ -465,7 +524,9 @@ vpa-pytorch/
 ├── LICENSE               # GPL-3.0
 └── docs/
     ├── README.md         # license note for the preprint
-    └── preprint_261008.pdf
+    ├── preprint_261008.pdf
+    ├── hf_model_card.md  # model card of the Hugging Face checkpoints
+    └── media/            # README GIFs (scripts/make_media.py)
 ```
 
 ## Citation
