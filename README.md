@@ -124,14 +124,24 @@ cd vpa-pytorch
 python3 -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
-pip install -r requirements.txt        # torch==2.14.1, transformers==5.19.0
+pip install -r requirements.txt        # torch==2.14.1, transformers==5.19.0, numpy==1.26.4, h5py
 pip install -r requirements-dev.txt    # optional: adds ruff for linting
 python -c "import torch; print(torch.__version__, torch.backends.mps.is_available())"
 ```
 
 **Linux / CUDA users:** install PyTorch first by following the instructions at
 [pytorch.org](https://pytorch.org/get-started/locally/) for your CUDA version (ideally torch 2.14.1), then run
-`pip install -r requirements.txt`. Only macOS on Apple M4 has been tested.
+`pip install -r requirements.txt`. The published LIBERO-10 results were produced on Linux with CUDA and Python 3.10.
+
+**Apple Silicon:** use a native arm64 Python. An Intel (x86_64) conda or Python running under Rosetta finds no
+torch wheel (`No matching distribution found for torch==2.14.1`). Check with
+`python -c "import platform; print(platform.machine())"`, which must print `arm64`.
+
+> [!IMPORTANT]
+> **Keep the pinned versions.** Evaluation with numpy 2.4, opencv-python 5.0, pillow 13 and robosuite 1.4.0
+> (what an unpinned install picked in October 2026) ran without any error, yet the published two-camera
+> checkpoint scored 0% on tasks it solves 55% of the time with the pinned versions. `eval.py` now refuses
+> these versions; `requirements-eval.txt` installs the tested ones.
 
 ## Quick start
 
@@ -221,6 +231,24 @@ same code:
 `dataset.py` reads LIBERO's HDF5 demonstrations, `train.py` runs the two training stages (stage 1: E_ψ and P_ω
 with Eq. 11; stage 2: π_φ^h and the solver on frozen latents) and `eval.py` runs closed-loop episodes in LIBERO.
 Training needs `h5py`; evaluation needs LIBERO and its simulator (see the docstring of `eval.py`).
+
+**Setting up evaluation.**
+
+```bash
+pip install -r requirements-eval.txt                 # pinned simulator stack (robosuite 1.4.1, mujoco 2.3.7, ...)
+git clone https://github.com/Lifelong-Robot-Learning/LIBERO
+pip install -e LIBERO --no-deps                      # not LIBERO's requirements.txt: it downgrades torch and numpy
+python -c "import libero.libero"                     # once, interactively: answers LIBERO's dataset-folder prompt
+# if that import fails with "No module named 'libero'":  export PYTHONPATH=$PWD/LIBERO:$PYTHONPATH
+
+# LIBERO's download script has no libero_10 option (it is part of libero_100); fetch only LIBERO-10:
+hf download yifengzhu-hf/LIBERO-datasets --repo-type dataset --include "libero_10/*" \
+    --local-dir LIBERO/libero/datasets
+```
+
+`eval.py --device auto` picks CUDA, then MPS, then CPU. On headless Linux set `MUJOCO_GL=egl`. The
+`CLIPTextModelWithProjection LOAD REPORT` listing `vision_model.*` keys as UNEXPECTED is harmless: only the
+text tower of CLIP is loaded.
 
 ```bash
 # one camera (the paper's setting)
@@ -517,7 +545,8 @@ vpa-pytorch/
 │   ├── make_media.py              # README GIFs and a video archive from eval.py --save-video runs
 │   └── export_checkpoint.py       # slim checkpoint + safetensors for sharing (Hugging Face)
 ├── results/libero10_pilot.json    # preliminary LIBERO-10 success rates
-├── requirements.txt      # torch, transformers (pinned)
+├── requirements.txt      # torch, transformers, numpy, h5py (pinned)
+├── requirements-eval.txt # + LIBERO's simulator stack, pinned (for eval.py)
 ├── requirements-dev.txt  # + ruff
 ├── CLAUDE.md             # development rules and design decisions
 ├── CITATION.cff

@@ -1,5 +1,11 @@
 # Direct runtime dependencies of the VPA reference implementation.
-# Tested with Python 3.13 on macOS 15 (Apple M4, arm64), MPS backend (torch.backends.mps).
 # Python >= 3.10 is required (zip(..., strict=True)).
+# Model code tested with Python 3.13 on macOS 15 (Apple M4, arm64, MPS). The published LIBERO-10 results
+# were produced with Python 3.10 on Linux (CUDA) with exactly these versions.
+# For closed-loop evaluation in LIBERO, install requirements-eval.txt instead (it includes this file).
 torch==2.14.1
 transformers==5.19.0
+# numpy is pinned to 1.x: with numpy 2.x (together with opencv 5, pillow 13 and robosuite 1.4.0) the
+# published checkpoints ran without errors but scored 0% in LIBERO. Do not upgrade without re-evaluating.
+numpy==1.26.4
+h5py==3.16.0

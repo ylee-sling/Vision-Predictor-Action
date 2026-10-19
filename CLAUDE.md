@@ -25,9 +25,13 @@ change any math.
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install --upgrade pip
-pip install torch transformers ruff        # macOS arm64 wheels include the MPS backend
+pip install -r requirements-dev.txt        # pinned torch, transformers, numpy, h5py + ruff (arm64 wheels include MPS)
+pip install -r requirements-eval.txt       # only for LIBERO evaluation: pinned simulator stack
 python -c "import torch; print(torch.__version__, torch.backends.mps.is_available())"
 ```
+
+- **Never loosen the pins** in `requirements*.txt`. numpy 2 / opencv 5 / robosuite 1.4.0 broke LIBERO evaluation
+  silently (0% success, no error); `eval.py` refuses them via `incompatible_libero_versions`.
 
 - Python ≥ 3.10 is required (`zip(..., strict=True)` is used).
 - **Run the self-tests on CPU.** They are deterministic and use float64 for reference values.
