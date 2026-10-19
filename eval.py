@@ -48,11 +48,15 @@ Decisions where the paper is silent (do not change silently):
       (seed + 1000 * task_id + trial), so results do not depend on the device or task subset.
 
 Requirements: LIBERO installed without its pinned requirements (``pip install -e LIBERO --no-deps``)
-plus the packages its simulator imports (``LIBERO_DEPENDENCIES``):
+plus the packages its simulator imports (``LIBERO_DEPENDENCIES``), at the versions that produced the
+published results:
 
-    pip install pyyaml "robosuite==1.4.0" "mujoco==2.3.7" "bddl==1.0.1" easydict matplotlib "gym==0.25.2" cloudpickle
+    pip install -r requirements-eval.txt
 
-``eval.py`` checks them before importing LIBERO and names the missing ones. Headless Linux usually
+``eval.py`` checks them before importing LIBERO, names the missing ones and refuses versions known to
+break evaluation silently (numpy 2, opencv 5, robosuite other than 1.4.1; see
+``incompatible_libero_versions``). If ``import libero`` fails after an editable install, add the LIBERO
+folder to ``PYTHONPATH``. Headless Linux usually
 needs ``MUJOCO_GL=egl``. LIBERO asks for its dataset folder on the first import; run
 ``python -c "import libero.libero"`` once interactively to create ``~/.libero/config.yaml``.
 ``--save-video`` needs ``imageio`` with ``imageio-ffmpeg``.
@@ -338,7 +342,7 @@ class DemoMilestones:
 # transformers, numpy, ...) are deliberately not repeated, since they would downgrade this project.
 LIBERO_DEPENDENCIES: Dict[str, str] = {
     "yaml": "pyyaml",
-    "robosuite": "robosuite==1.4.0",
+    "robosuite": "robosuite==1.4.1",
     "mujoco": "mujoco==2.3.7",   # robosuite 1.4 breaks on MuJoCo 3 (get_joint_qpos_addr assertion)
     "bddl": "bddl==1.0.1",
     "easydict": "easydict",
@@ -361,17 +365,54 @@ def missing_libero_dependencies() -> List[str]:
     return missing
 
 
+def _installed_version(*distributions: str) -> Optional[str]:
+    """Version of the first installed distribution among ``distributions`` (None if none is installed)."""
+    for name in distributions:
+        try:
+            return importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            continue
+    return None
+
+
+def _major_version(version: str) -> int:
+    head = version.split(".")[0]
+    return int(head) if head.isdigit() else 0
+
+
+# Set to 1 to evaluate with versions outside the tested ones (results may not be comparable).
+ALLOW_UNTESTED_VERSIONS_ENV = "VPA_ALLOW_UNTESTED_VERSIONS"
+
+
 def incompatible_libero_versions() -> List[str]:
-    """Known-bad version combinations of LIBERO's simulator stack (empty if none or not installed)."""
-    try:
-        robosuite_version = importlib.metadata.version("robosuite")
-        mujoco_version = importlib.metadata.version("mujoco")
-    except importlib.metadata.PackageNotFoundError:
-        return []
+    """Known-bad versions of LIBERO's simulator stack and its numeric libraries (empty if none).
+
+    Two kinds of problem are reported. robosuite 1.4 with MuJoCo 3 fails loudly. numpy 2, opencv 5 and
+    robosuite other than 1.4.1 fail silently: with numpy 2.4.6, opencv-python 5.0, pillow 13.0 and
+    robosuite 1.4.0, the published LIBERO-10 checkpoint ran without errors but scored 0% on tasks it
+    solves 55% of the time with the versions in requirements-eval.txt. Setting
+    ``VPA_ALLOW_UNTESTED_VERSIONS=1`` skips the silent-failure checks.
+    """
     problems = []
-    if robosuite_version.startswith("1.4") and int(mujoco_version.split(".")[0]) >= 3:
+    robosuite_version = _installed_version("robosuite")
+    mujoco_version = _installed_version("mujoco")
+    if robosuite_version and mujoco_version and robosuite_version.startswith("1.4") \
+            and _major_version(mujoco_version) >= 3:
         problems.append(f"robosuite {robosuite_version} (used by LIBERO) does not work with mujoco {mujoco_version}; "
                         'run: pip install "mujoco==2.3.7"')
+    if os.environ.get(ALLOW_UNTESTED_VERSIONS_ENV) == "1":
+        return problems
+    numpy_version = _installed_version("numpy")
+    if numpy_version and _major_version(numpy_version) >= 2:
+        problems.append(f'numpy {numpy_version} is untested here and broke evaluation silently; run: pip install "numpy==1.26.4"')
+    opencv_version = _installed_version("opencv-python", "opencv-python-headless")
+    if opencv_version and _major_version(opencv_version) >= 5:
+        problems.append(f'opencv-python {opencv_version} is untested here; run: pip install "opencv-python==4.11.0.86"')
+    if robosuite_version and robosuite_version != "1.4.1":
+        problems.append(f'robosuite {robosuite_version} is untested here; run: pip install "robosuite==1.4.1"')
+    if problems:
+        problems.append(f"or install everything at once with: pip install -r requirements-eval.txt "
+                        f"(set {ALLOW_UNTESTED_VERSIONS_ENV}=1 to run anyway)")
     return problems
 
 

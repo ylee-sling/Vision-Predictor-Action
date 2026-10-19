@@ -1,0 +1,23 @@
+# Closed-loop evaluation in LIBERO (eval.py): this project's requirements plus LIBERO's simulator stack,
+# pinned to the versions that produced the published LIBERO-10 results.
+#
+#   pip install -r requirements-eval.txt
+#   git clone https://github.com/Lifelong-Robot-Learning/LIBERO && pip install -e LIBERO --no-deps
+#
+# Do not install LIBERO's own requirements.txt: it pins old torch, transformers and numpy versions.
+# Newer versions of these packages can change the simulated observations without raising any error,
+# so eval.py refuses known-bad versions (see incompatible_libero_versions in eval.py).
+-r requirements.txt
+robosuite==1.4.1
+mujoco==2.3.7
+opencv-python==4.11.0.86
+pillow==12.3.0
+bddl==1.0.1
+gym==0.25.2
+pyyaml
+easydict
+matplotlib
+cloudpickle
+huggingface_hub
+imageio
+imageio-ffmpeg
