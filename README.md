@@ -1,5 +1,14 @@
 # Vision-Predictor-Action (VPA)
 
+<p align="center">
+  <img src="docs/media/task08_trial02_2cam.gif" alt="A simulated robot arm puts two moka pots on a stove, seen from a third-person camera (left) and a wrist camera (right)">
+</p>
+<p align="center">
+  <sub>A trained VPA policy on the LIBERO-10 benchmark (simulation): <i>"put both moka pots on the stove"</i>.
+  Left: third-person camera; right: wrist camera; 2× speed.<br>
+  One successful episode; this policy solves the task in 45% of trials (preliminary, see <a href="#results-on-libero-10-preliminary">Results</a>).</sub>
+</p>
+
 A PyTorch reference implementation of a goal-conditioned robot control loop that plans in a learned latent space, picks a symbolic skill, and generates a whole action chunk with a few flow-matching steps.
 
 [![License: GPL-3.0-only](https://img.shields.io/badge/License-GPL--3.0--only-blue.svg)](LICENSE)
@@ -49,7 +58,34 @@ A copy of the preprint is included at [`docs/preprint_261008.pdf`](docs/preprint
 
 ## Architecture
 
-One decision step, following Fig. 2 of the paper:
+```mermaid
+flowchart TB
+    CAM["Camera image<br/>(every step)"]
+    GOAL["Instruction + goal images<br/>(once per episode)"]
+    subgraph STEP["One decision step: K + 3 network calls"]
+        direction LR
+        ENC["<b>1. Encoder</b><br/>image → latent"] --> SEL["<b>2. Selector</b><br/>picks a skill"]
+        SEL --> PRED["<b>3. Predictor</b><br/>next latent<br/>+ uncertainty"]
+        PRED --> SOL["<b>4. Solver</b><br/>noise → H actions<br/>in K steps"]
+    end
+    CAM --> STEP
+    GOAL --> STEP
+    STEP --> ACT["Robot executes the first<br/>H_t actions, then replans"]
+```
+
+Each time the robot replans, four networks run in a row. The **encoder** turns the camera image into a latent
+vector, a compact summary of the scene. The **selector** picks a skill such as *reach* or *grasp* and keeps track of
+which goal image comes next. The **predictor** forecasts the next latent under that skill, with an uncertainty
+score. The **solver** turns random noise into a chunk of H future actions in K = 1–3 steps, guided by the skill, the
+current and predicted latents, the instruction and the robot's joint state. The robot executes the first H_t of those
+actions, fewer when the predictor is uncertain, and then replans.
+
+Because the whole chunk comes from K solver steps, one decision step always costs K + 3 network calls, however long
+the chunk is. Each stage is one file (`perception.py`, `selector.py`, `predictor.py`, `solver.py`), and
+`pipeline.py` connects them.
+
+<details>
+<summary>Detailed diagram in the paper's notation (Fig. 2)</summary>
 
 ```mermaid
 flowchart TD
@@ -87,6 +123,8 @@ flowchart TD
 The milestone latents z_g^(m) and the text embedding c_text are computed once per episode, so the per-step chain is
 E_ψ → π_φ^h → P_ω → v_θ (K times): **K + 3 sequential evaluations regardless of H** (Proposition 5.1).
 `VPAInferencePipeline.step` audits this sequence at runtime with forward hooks and raises if it differs.
+
+</details>
 
 ## Equation-to-code map
 
