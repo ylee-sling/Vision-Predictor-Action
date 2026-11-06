@@ -1,12 +1,12 @@
 # Vision-Predictor-Action (VPA)
 
 <p align="center">
-  <img src="docs/media/task08_trial02_2cam.gif" alt="A simulated robot arm puts two moka pots on a stove, seen from a third-person camera (left) and a wrist camera (right)">
+  <img src="docs/media/task05_trial01_2cam.gif" alt="A simulated robot arm picks up a book and places it in the back compartment of a caddy, seen from a third-person camera (left) and a wrist camera (right)">
 </p>
 <p align="center">
-  <sub>A trained VPA policy on the LIBERO-10 benchmark (simulation): <i>"put both moka pots on the stove"</i>.
+  <sub>A trained VPA policy on the LIBERO-10 benchmark (simulation): <i>"pick up the book and place it in the back compartment of the caddy"</i>.
   Left: third-person camera; right: wrist camera; 2× speed.<br>
-  One successful episode; this policy solves the task in 45% of trials (preliminary, see <a href="#results-on-libero-10-preliminary">Results</a>).</sub>
+  One successful episode; this policy solves the task in 50% of trials (preliminary, see <a href="#results-on-libero-10-preliminary">Results</a>).</sub>
 </p>
 
 A PyTorch reference implementation of a goal-conditioned robot control loop that plans in a learned latent space, picks a symbolic skill, and generates a whole action chunk with a few flow-matching steps.
